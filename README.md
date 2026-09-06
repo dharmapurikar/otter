@@ -10,6 +10,8 @@ private API the extension uses and presents it through Omarchy's own shell: a
 themed Quickshell bar widget + panel, plus a small Python helper that handles
 sign-in, the API, and PipeWire recording.
 
+![Otter bar widget with its panel open — READY state, start button, microphone source, and recent conversations](preview.png)
+
 > ⚠️ Personal, unofficial, private. Built on Otter's private API (learned by
 > reading the Chrome extension). Not affiliated with Otter.ai; may break if
 > the API changes. Like every Omarchy plugin it runs unsandboxed with your

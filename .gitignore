@@ -1,0 +1,12 @@
+# runtime state (never commit session cookies or audio)
+*.log
+__pycache__/
+*.pyc
+.venv/
+/scratch/
+# never commit credentials, session state, audio or transcripts
+session.json
+*.wav
+*.pcm
+*.raw
+/recordings/

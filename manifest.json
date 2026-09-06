@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dharmapurikar.otter",
+  "name": "Otter",
+  "version": "1.0.0",
+  "author": "sachin",
+  "license": "MIT",
+  "description": "Otter.ai in the Omarchy bar: records meetings from PipeWire as they are detected -- microphone and system audio, live transcript, AI summaries, and your recent conversations. No meeting bot; nothing joins your calls.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Otter",
+    "description": "One minimal bar glyph: records meetings it detects after a countdown you can cancel, starts and stops on request, and opens your latest Otter conversations.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "micDevice": "",
+      "captureSystemAudio": true,
+      "showMeter": true,
+      "recentCount": 3,
+      "refreshIntervalSec": 300,
+      "browser": "chrome",
+      "chromeProfile": "Default",
+      "meetingDetection": "on",
+      "meetingAutoRecord": true,
+      "meetingPatterns": ""
+    },
+    "schema": [
+      {
+        "key": "micDevice",
+        "type": "string",
+        "label": "Microphone",
+        "defaultValue": "",
+        "description": "PipeWire source to record from; empty follows the system default. Easiest set from the panel's picker (press s)."
+      },
+      {
+        "key": "captureSystemAudio",
+        "type": "boolean",
+        "label": "Capture system audio",
+        "defaultValue": true,
+        "description": "Mix in what your speakers are playing, so the other side of a meeting is transcribed too. Turn off for a microphone-only memo."
+      },
+      {
+        "key": "showMeter",
+        "type": "boolean",
+        "label": "Show input level meter",
+        "defaultValue": true,
+        "description": "Show the input-level meter in the panel while recording."
+      },
+      {
+        "key": "meetingDetection",
+        "type": "enum",
+        "options": [
+          "on",
+          "off"
+        ],
+        "label": "Meeting detection",
+        "defaultValue": "on",
+        "description": "Watch for meetings (Meet, Zoom, Teams, Whereby, Jitsi, Slack huddles, Discord, plus your own patterns) and offer to record them. For always-open apps like Teams, the microphone must be in use too."
+      },
+      {
+        "key": "meetingAutoRecord",
+        "type": "boolean",
+        "label": "Start and stop recording automatically",
+        "defaultValue": true,
+        "description": "On: record after a 5-second countdown you can cancel from the toast, and stop the same way when the meeting ends. Off: see the toasts, click to start and stop yourself."
+      },
+      {
+        "key": "meetingPatterns",
+        "type": "string",
+        "label": "Extra meeting matches",
+        "defaultValue": "",
+        "description": "Comma-separated fragments matched against a window's app id or title, for conferencing tools not recognised by default."
+      },
+      {
+        "key": "recentCount",
+        "type": "integer",
+        "label": "Recent conversations shown",
+        "min": 1,
+        "max": 6,
+        "step": 1,
+        "defaultValue": 3
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "browser",
+        "type": "enum",
+        "options": [
+          "chrome",
+          "chromium",
+          "brave",
+          "edge"
+        ],
+        "label": "Browser holding the Otter session",
+        "defaultValue": "chrome",
+        "description": "Which browser's cookies to read the Otter session from."
+      },
+      {
+        "key": "chromeProfile",
+        "type": "string",
+        "label": "Browser profile",
+        "defaultValue": "Default",
+        "description": "Profile directory name, e.g. Default or \"Profile 1\"."
+      }
+    ]
+  }
+}

@@ -2039,6 +2039,137 @@ class TestReconcileDoesNotBlankThePanel(SingleFlightBase):
         self.assertTrue(self.frames("state"))
 
 
+class TestPruneSpools(unittest.TestCase):
+    """Spool housekeeping. A spool is the last copy of audio Otter did not
+    get, so the tests here are mostly about what must *not* be deleted."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="otter_prune_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.now = time.time()
+
+    def spool(self, otid, nbytes=32000, age_days=0.0):
+        path = os.path.join(self.dir, f"{otid}.pcm")
+        with open(path, "wb") as fh:
+            fh.write(b"\x00" * nbytes)
+        when = self.now - age_days * 86400
+        os.utime(path, (when, when))
+        return path
+
+    def prune(self, **kw):
+        kw.setdefault("now", self.now)
+        return record.prune_spools(self.dir, **kw)
+
+    def names(self):
+        return sorted(os.listdir(self.dir))
+
+    def test_empty_spools_go_on_sight(self):
+        self.spool("empty", nbytes=0)
+        removed = self.prune()
+        self.assertEqual([r["reason"] for r in removed], ["empty"])
+        self.assertEqual(self.names(), [])
+
+    def test_recent_audio_is_kept(self):
+        self.spool("fresh", nbytes=320000, age_days=1)
+        self.assertEqual(self.prune(), [])
+        self.assertEqual(self.names(), ["fresh.pcm"])
+
+    def test_audio_past_the_window_goes(self):
+        self.spool("old", nbytes=320000, age_days=8)
+        removed = self.prune()
+        self.assertEqual(removed[0]["reason"], "stale")
+        self.assertEqual(removed[0]["seconds"], 10.0)
+        self.assertEqual(removed[0]["ageDays"], 8.0)
+        self.assertEqual(self.names(), [])
+
+    def test_the_window_boundary_is_inclusive(self):
+        self.spool("edge", nbytes=32000, age_days=7)
+        self.assertEqual(len(self.prune()), 1)
+
+    def test_a_protected_spool_is_never_touched(self):
+        # Still live, so reap_orphan can still replay it -- deleting it here
+        # would throw away the recording the recovery path exists for.
+        self.spool("live", nbytes=320000, age_days=99)
+        self.assertEqual(self.prune(protect={"live"}), [])
+        self.assertEqual(self.names(), ["live.pcm"])
+
+    def test_protection_covers_empty_spools_too(self):
+        # The recording in progress has a 0-byte spool for its first moments.
+        self.spool("starting", nbytes=0)
+        self.assertEqual(self.prune(protect={"starting"}), [])
+        self.assertEqual(self.names(), ["starting.pcm"])
+
+    def test_dry_run_removes_nothing(self):
+        self.spool("empty", nbytes=0)
+        self.spool("old", nbytes=32000, age_days=9)
+        removed = self.prune(dry_run=True)
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(self.names(), ["empty.pcm", "old.pcm"])
+
+    def test_non_spool_files_are_left_alone(self):
+        with open(os.path.join(self.dir, "notes.txt"), "w") as fh:
+            fh.write("not a spool")
+        self.assertEqual(self.prune(), [])
+        self.assertIn("notes.txt", self.names())
+
+    def test_a_missing_directory_is_not_an_error(self):
+        self.assertEqual(record.prune_spools(os.path.join(self.dir, "nope")), [])
+
+    def test_keep_days_zero_takes_everything_unprotected(self):
+        self.spool("a", nbytes=32000)
+        self.spool("b", nbytes=32000)
+        self.spool("c", nbytes=32000)
+        removed = self.prune(keep_days=0, protect={"c"})
+        self.assertEqual(sorted(r["otid"] for r in removed), ["a", "b"])
+        self.assertEqual(self.names(), ["c.pcm"])
+
+    def test_it_reports_what_it_removed(self):
+        self.spool("gone", nbytes=64000, age_days=10)
+        r = self.prune()[0]
+        self.assertEqual(r["otid"], "gone")
+        self.assertEqual(r["bytes"], 64000)
+        self.assertEqual(r["seconds"], 2.0)
+        self.assertTrue(r["path"].endswith("gone.pcm"))
+
+
+class TestReconcilePrunes(SingleFlightBase):
+    """The daemon prunes on startup, and protects what it must."""
+
+    def test_startup_drops_an_empty_spool(self):
+        server = self.make()
+        os.makedirs(server.spool_dir, exist_ok=True)
+        open(os.path.join(server.spool_dir, "junk.pcm"), "wb").close()
+        server.reconcile()
+        self.assertFalse(os.path.exists(
+            os.path.join(server.spool_dir, "junk.pcm")))
+
+    def test_a_live_speechs_spool_survives_the_prune(self):
+        # It is still replayable, and reconcile has just reaped it.
+        server = self.make(live=[{"otid": "stray"}])
+        path = self.spool(server, "stray")
+        os.utime(path, (0, 0))  # ancient, so only protection can save it
+        server.reconcile()
+        self.assertTrue(os.path.exists(path))
+
+    def test_losing_un_uploaded_audio_is_announced(self):
+        server = self.make()
+        path = self.spool(server, "old")
+        with open(path, "wb") as fh:
+            fh.write(b"\x00" * 320000)
+        os.utime(path, (0, 0))
+        server.reconcile()
+        self.assertTrue(any("un-uploaded recording" in e.get("message", "")
+                            for e in self.frames("error")))
+
+    def test_housekeeping_is_not_announced(self):
+        # An empty spool going is not news; only audio going is.
+        server = self.make()
+        open(os.path.join(self.spool(server, "empty")), "wb").close()
+        server.reconcile()
+        self.assertEqual([e for e in self.frames("error")
+                          if "un-uploaded" in e.get("message", "")], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

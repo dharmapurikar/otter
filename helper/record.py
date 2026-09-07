@@ -152,6 +152,74 @@ def replay_spool(sock, speech_id: str, spool_path: str, acked: int) -> int:
     return sent
 
 
+# How long a spool that still holds audio Otter never received is kept before
+# it is pruned. Long enough to notice and do something about it, short enough
+# that a laptop does not quietly accumulate gigabytes of half-uploaded
+# meetings. An empty spool is not covered by this: there is nothing in it to
+# lose, so it goes on sight.
+SPOOL_KEEP_DAYS = 7
+
+
+def prune_spools(spool_dir: str, keep_days: float = SPOOL_KEEP_DAYS,
+                 protect: set | None = None, now: float | None = None,
+                 dry_run: bool = False) -> list[dict]:
+    """Remove spool files that can no longer do any good.
+
+    A spool is the last copy of audio Otter did not get, so this is
+    deliberately timid. Three rules:
+
+    * Empty spools go immediately -- a failed start leaves a 0-byte file and
+      there is nothing in it to lose.
+    * A spool for a protected recording is never touched: the recording in
+      progress, or a speech still live and therefore still replayable by
+      `reap_orphan`.
+    * Anything else is audio nobody can upload any more, and it is kept for
+      `keep_days` before going, so a lost meeting is recoverable by hand for
+      a week rather than deleted the moment its daemon restarts.
+
+    Returns what it removed (or would remove, under `dry_run`) so the caller
+    can say so out loud instead of deleting a meeting silently.
+    """
+    protect = protect or set()
+    now = time.time() if now is None else now
+    cutoff = keep_days * 86400
+    removed: list[dict] = []
+    try:
+        names = sorted(os.listdir(spool_dir))
+    except OSError:
+        return removed
+
+    for name in names:
+        if not name.endswith(".pcm"):
+            continue
+        otid = name[:-4]
+        if otid in protect:
+            continue
+        path = os.path.join(spool_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        age = max(0.0, now - st.st_mtime)
+        if st.st_size == 0:
+            reason = "empty"
+        elif age >= cutoff:
+            reason = "stale"
+        else:
+            continue
+        entry = {"otid": otid, "path": path, "bytes": st.st_size,
+                 "seconds": round(st.st_size / (audio.SAMPLE_RATE
+                                                * audio.SAMPLE_WIDTH), 1),
+                 "ageDays": round(age / 86400, 1), "reason": reason}
+        if not dry_run:
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+        removed.append(entry)
+    return removed
+
+
 def reap_orphan(api, cookies: dict, userid: str, otid: str,
                 start_time: int = 0, log=None,
                 connect_timeout: float = 8.0,

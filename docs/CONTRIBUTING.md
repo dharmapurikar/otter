@@ -167,6 +167,7 @@ python3 helper/otter.py selftest --seconds 3       # capture only: no network,
 python3 helper/otter.py status --n 3               # live API (needs session)
 python3 helper/otter.py live                       # recordings Otter thinks are running
 python3 helper/otter.py reap --all                 # close strays (needs session)
+python3 helper/otter.py prune --dry-run            # what spool housekeeping would remove
 ```
 
 `qmllint` cannot resolve `qs.Commons` / `qs.Ui` without Quickshell's module

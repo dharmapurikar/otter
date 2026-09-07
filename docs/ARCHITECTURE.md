@@ -372,10 +372,33 @@ limited to a single tab; PipeWire gives us the whole system.
 |---|---|---|
 | `~/.config/omarchy/plugins/io.github.dharmapurikar.otter/` | user | the installed plugin, keyed by id |
 | `~/.local/state/omarchy/otter/session.json` | helper | cached cookies + userid, `0600` |
-| `~/.local/state/omarchy/otter/recordings/` | helper | append-only PCM spool per recording; kept only when audio never reached the wire |
+| `~/.local/state/omarchy/otter/recordings/` | helper | append-only PCM spool per recording; kept only when audio never reached the wire, and pruned on the policy below |
 | `~/.local/state/omarchy/otter/active.json` | helper | the recording in progress: otid, speech id, owning pid, acked offset. `0600`, written atomically |
 | `~/.local/state/omarchy/otter/autostart.json` | helper | last meeting auto-recorded, for the cooldown |
 | `~/.config/omarchy/shell.json` | shell | the widget's layout entry + its settings |
+
+## What happens to a spool
+
+Every recording writes its audio to `recordings/<otid>.pcm` before any of it
+goes on the wire, and `finish()` deletes that file only once Otter has all of
+it. What is left behind is therefore audio Otter never received -- the last
+copy of some part of a meeting -- which is why nothing deletes it eagerly.
+
+Pruning runs on every daemon start, after reconciling, on three rules:
+
+- **Empty spools go on sight.** A start that failed before capture produced
+  anything leaves a 0-byte file; there is nothing in it to lose.
+- **A protected spool is never touched:** the recording in progress, and any
+  speech still live and therefore still replayable by the recovery path.
+  Ancient is not a reason to delete something that can still be uploaded.
+- **Everything else is kept for seven days**, then removed with a message
+  saying how much audio went. A meeting the network lost stays recoverable by
+  hand for a week rather than disappearing the moment its daemon restarts.
+
+`helper/otter.py prune --dry-run` shows what would go; `--days N` overrides
+the window. A spool whose Otter conversation has been deleted cannot be
+replayed anywhere -- `speech_start` only re-opens a speech that still exists --
+so those simply age out.
 
 ## One recording at a time
 

@@ -15,6 +15,7 @@ Subcommands:
     devices               PipeWire inputs, for the microphone picker
     live                  recordings Otter still thinks are running
     reap [otid...|--all]  close stray live recordings
+    prune [--days N]      drop spool files that can no longer be uploaded
     selftest              capture only: no network, audio counted and discarded
     serve                 daemon mode, driven by the QML side over stdin
 
@@ -714,6 +715,39 @@ def cmd_summarize(args) -> dict:
             "summary": ask_llm(cookies, transcript, args.prompt), "error": ""}
 
 
+def cmd_prune(args) -> dict:
+    """Drop spool files that can no longer be uploaded.
+
+    Runs on every daemon start too; this is the by-hand version, with
+    `--dry-run` so you can see what would go before it goes.
+    """
+    import record
+
+    spool_dir = os.path.join(STATE_DIR, "recordings")
+    protect = set()
+    marker = record.read_active(STATE_DIR)
+    if marker and marker.get("otid"):
+        protect.add(str(marker["otid"]))
+    # A live speech is still replayable, so its spool is never a candidate.
+    try:
+        protect |= {s["otid"] for s in live_speeches(get_cookies(args))}
+    except OtterError:
+        # No session: fall back to the marker alone rather than pruning
+        # something the account might still be able to receive.
+        pass
+
+    keep_days = record.SPOOL_KEEP_DAYS if args.days is None else args.days
+    removed = record.prune_spools(spool_dir, keep_days=keep_days,
+                                  protect=protect, dry_run=args.dry_run)
+    return {"ok": True, "authenticated": True,
+            "dryRun": bool(args.dry_run),
+            "keepDays": keep_days,
+            "protected": sorted(protect),
+            "removed": removed,
+            "freedBytes": sum(r["bytes"] for r in removed),
+            "error": ""}
+
+
 def cmd_live(args) -> dict:
     """Every recording Otter still thinks is running."""
     cookies = get_cookies(args)
@@ -895,6 +929,15 @@ def main() -> int:
     p_live = sub.add_parser("live", help="list recordings Otter still thinks "
                                          "are running")
     p_live.set_defaults(func=cmd_live)
+
+    p_prune = sub.add_parser("prune", help="drop spool files that can no "
+                                           "longer be uploaded")
+    p_prune.add_argument("--days", type=float, default=None,
+                         help="keep un-uploaded audio this many days "
+                              "(default: 7; empty spools always go)")
+    p_prune.add_argument("--dry-run", action="store_true",
+                         help="report what would go without removing it")
+    p_prune.set_defaults(func=cmd_prune)
 
     p_reap = sub.add_parser("reap", help="close stray live recordings")
     p_reap.add_argument("otid", nargs="*", help="conversations to close")

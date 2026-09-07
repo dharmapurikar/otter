@@ -563,6 +563,28 @@ class Server:
                     f"{left:.1f}s of an interrupted recording could not be "
                     f"uploaded; kept at {res['keptSpool']}"))
 
+        # Now that the strays are dealt with, drop spool files that can no
+        # longer help. Protected: anything still live, and so still
+        # replayable, plus whatever the marker names.
+        protect = set(live_otids)
+        if marker_otid:
+            protect.add(marker_otid)
+        pruned = record.prune_spools(self.spool_dir, protect=protect)
+        if pruned:
+            self.log_event("pruned_spools", count=len(pruned),
+                           files=[{k: p[k] for k in
+                                   ("otid", "seconds", "ageDays", "reason")}
+                                  for p in pruned])
+            # An empty spool going is housekeeping. Audio going is worth
+            # saying out loud -- it was the last copy of something.
+            lost = [p for p in pruned if p["reason"] == "stale"]
+            if lost:
+                total = sum(p["seconds"] for p in lost)
+                self.emit(type="error", errorClass="internal", message=(
+                    f"removed {len(lost)} un-uploaded recording"
+                    f"{'s' if len(lost) > 1 else ''} "
+                    f"({total:.0f}s) older than {record.SPOOL_KEEP_DAYS} days"))
+
         record.clear_active(self.core.STATE_DIR)
         self.reconciled = True
         self._reconcile_pending = False

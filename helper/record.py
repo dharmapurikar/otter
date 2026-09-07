@@ -46,6 +46,10 @@ ACK_TOLERANCE_BYTES = (audio.SAMPLE_RATE * audio.SAMPLE_WIDTH) // 2
 # close. Sub-second waits were not tested; a second either side is cheap
 # against a path that runs once per crash and must actually land.
 REAP_SETTLE_SEC = 1.0
+# Ceiling on replaying a recovered spool. 32 kB/s means even a four-hour
+# meeting is a few hundred megabytes and seconds of wire time; this only
+# bounds a socket that has stopped accepting.
+REPLAY_TIMEOUT_SEC = 60.0
 
 
 class RecordError(Exception):
@@ -125,9 +129,33 @@ def pid_alive(pid: int) -> bool:
     return "otter.py" in cmdline
 
 
+def replay_spool(sock, speech_id: str, spool_path: str, acked: int) -> int:
+    """Push the unsent tail of a recovered spool. Returns bytes sent.
+
+    The socket must already be bound at `offset = acked // SAMPLE_WIDTH`, so
+    the offsets Otter is told about and the file position we resume from come
+    from the same number. That consistency is the whole trick: a stale
+    `acked` re-sends audio Otter already had at the offsets it had it at,
+    rather than skipping any -- so a marker that is a minute out of date
+    costs a little duplicate upload and loses nothing.
+    """
+    sent = 0
+    deadline = time.monotonic() + REPLAY_TIMEOUT_SEC
+    with open(spool_path, "rb") as fh:
+        fh.seek(acked)
+        while time.monotonic() < deadline:
+            chunk = fh.read(FRAME_BYTES)
+            if not chunk:
+                break
+            sock.send_binary(chunk)
+            sent += len(chunk)
+    return sent
+
+
 def reap_orphan(api, cookies: dict, userid: str, otid: str,
                 start_time: int = 0, log=None,
-                connect_timeout: float = 8.0) -> dict:
+                connect_timeout: float = 8.0,
+                spool_path: str = "", acked: int = -1) -> dict:
     """End a live speech that nobody owns any more.
 
     Three measured facts make this the shape it is:
@@ -147,6 +175,13 @@ def reap_orphan(api, cookies: dict, userid: str, otid: str,
 
     Only ever call this for a speech confirmed live. Re-opening a *finished*
     one would put it back into RECORDING, which is worse than the orphan.
+
+    With a `spool_path` and a known `acked`, the audio the dead process never
+    got onto the wire is replayed before the stop -- the meeting is recovered
+    rather than merely closed. `acked = -1` means the offset is unknown (a
+    live speech we own but have no marker for), and then nothing is replayed:
+    guessing an offset would either duplicate or silently drop audio, and the
+    spool is kept on disk instead.
     """
     log = log or (lambda **kw: None)
     if not otid:
@@ -165,7 +200,18 @@ def reap_orphan(api, cookies: dict, userid: str, otid: str,
     if not ws_url or not speech_id:
         raise RecordError(f"speech_start did not re-issue a socket for {otid}")
 
+    # What is left to recover, if anything.
+    unsent = 0
+    if spool_path and acked >= 0:
+        try:
+            unsent = max(0, os.path.getsize(spool_path) - acked)
+        except OSError:
+            spool_path = ""
+
+    offset_samples = (acked // audio.SAMPLE_WIDTH) if acked > 0 else 0
     stop_error = ""
+    replay_error = ""
+    replayed = 0
     sock = None
     try:
         sock = wsclient.WebSocket.connect(ws_url, timeout=connect_timeout)
@@ -174,9 +220,18 @@ def reap_orphan(api, cookies: dict, userid: str, otid: str,
     if sock:
         try:
             sock.send_text(json.dumps({
-                "action": "start", "speech_id": speech_id, "offset": 0,
+                "action": "start", "speech_id": speech_id,
+                "offset": offset_samples,
             }))
             time.sleep(REAP_SETTLE_SEC)
+            if unsent:
+                # Recovering the audio is worth more than closing the
+                # session tidily, but not at the cost of closing it at all:
+                # a replay that fails still falls through to the stop.
+                try:
+                    replayed = replay_spool(sock, speech_id, spool_path, acked)
+                except Exception as e:
+                    replay_error = str(e)
             sock.send_text(json.dumps({
                 "action": "stop", "speech_id": speech_id,
             }))
@@ -202,12 +257,31 @@ def reap_orphan(api, cookies: dict, userid: str, otid: str,
     except Exception as e:
         finish_error = str(e)
 
+    # The spool only goes once Otter has all of it. Anything less and the
+    # file on disk is the last copy of that meeting.
+    kept_spool = spool_path
+    # `acked >= 0` is load-bearing: with an unknown offset nothing is
+    # replayed and `unsent` is 0, so without it "replayed everything" held
+    # vacuously and deleted the last copy of the audio.
+    recovered = bool(spool_path) and acked >= 0 and replayed >= unsent \
+        and not (stop_error or replay_error or finish_error)
+    if recovered:
+        try:
+            os.unlink(spool_path)
+            kept_spool = ""
+        except OSError:
+            pass
+
     result = {
         "otid": otid,
         "speechId": speech_id,
         "url": f"https://otter.ai/u/{otid}",
         "stopped": not stop_error,
         "stopError": stop_error,
+        "unsentBytes": unsent,
+        "replayedBytes": replayed,
+        "replayError": replay_error,
+        "keptSpool": kept_spool,
         "finishError": finish_error,
     }
     log(event="reap", **result)

@@ -27,7 +27,7 @@ Protocol (newline-delimited JSON both ways, see docs/ARCHITECTURE.md):
        {"type":"finishing","otid":"...","remaining":0.4}
        {"type":"live","otid":"...","text":"...","connected":true}
        {"type":"stopped","otid":"...","url":"...","duration":312}
-       {"type":"reconciled","otid":"...","stopped":true,"keptSpool":""}  # a stray live speech was closed
+       {"type":"reconciled","otid":"...","stopped":true,"keptSpool":"","recoveredSec":12.4}  # a stray live speech was closed, its spool replayed
        {"type":"devices","devices":[...]}
        {"type":"transcript","otid":"...","text":"...","error":""}
        {"type":"summary","otid":"...","text":"...","error":""}
@@ -435,6 +435,30 @@ class Server:
             return False
         return os.path.exists(os.path.join(self.spool_dir, f"{otid}.pcm"))
 
+    @staticmethod
+    def seconds(nbytes: int) -> float:
+        return max(0.0, float(nbytes) / (audio.SAMPLE_RATE * audio.SAMPLE_WIDTH))
+
+    def recovery_args(self, marker: dict | None, otid: str) -> dict:
+        """What of a stranded recording can still be recovered.
+
+        Only the marker knows how far the upload had actually got, so only
+        the recording it names can be replayed. For a live speech we own but
+        have no marker for, the offset is unknown and guessing one would
+        either duplicate audio or silently drop it -- so the spool is kept on
+        disk and reported instead.
+        """
+        spool = os.path.join(self.spool_dir, f"{otid}.pcm")
+        if not os.path.exists(spool):
+            return {}
+        if not marker or str(marker.get("otid") or "") != otid:
+            return {"spool_path": spool, "acked": -1}
+        try:
+            acked = int(marker.get("acked") or 0)
+        except (TypeError, ValueError):
+            acked = 0
+        return {"spool_path": spool, "acked": max(0, acked)}
+
     def reconcile(self) -> None:
         """Ensure at most one recording exists, before one can start.
 
@@ -508,7 +532,7 @@ class Server:
                 res = record.reap_orphan(
                     self.core.Api, self.cookies, self.userid, otid,
                     start_time=int(info.get("startTime") or 0),
-                    log=self.log_event)
+                    log=self.log_event, **self.recovery_args(marker, otid))
             except Exception as e:
                 _cls, msg = classify_error(e)
                 self.log_event("reap_failed", otid=otid, error=msg)
@@ -518,15 +542,21 @@ class Server:
                     f"an interrupted recording ({otid[:8]}) is still live on "
                     f"Otter and could not be closed: {msg}"))
                 continue
-            kept = os.path.join(self.spool_dir, f"{otid}.pcm")
-            kept = kept if os.path.exists(kept) else ""
             self.emit(type="reconciled", otid=otid,
-                      stopped=bool(res.get("stopped")), keptSpool=kept,
+                      stopped=bool(res.get("stopped")),
+                      keptSpool=str(res.get("keptSpool") or ""),
+                      recoveredSec=self.seconds(res.get("replayedBytes") or 0),
                       url=res.get("url", ""))
             if not res.get("stopped"):
                 self.emit(type="error", errorClass="network", message=(
                     f"an interrupted recording ({otid[:8]}) may still be live "
                     f"on Otter: {res.get('stopError') or 'unknown'}"))
+            elif res.get("keptSpool"):
+                left = self.seconds(res.get("unsentBytes", 0)
+                                    - (res.get("replayedBytes") or 0))
+                self.emit(type="error", errorClass="network", message=(
+                    f"{left:.1f}s of an interrupted recording could not be "
+                    f"uploaded; kept at {res['keptSpool']}"))
 
         record.clear_active(self.core.STATE_DIR)
         self.reconciled = True
@@ -643,10 +673,15 @@ class Server:
         for otid in ours[:MAX_REAP]:
             info = next((s for s in live_list if s["otid"] == otid), {})
             try:
-                record.reap_orphan(self.core.Api, self.cookies, self.userid,
-                                   otid, start_time=int(info.get("startTime") or 0),
-                                   log=self.log_event)
-                self.emit(type="reconciled", otid=otid, stopped=True)
+                marker = record.read_active(self.core.STATE_DIR)
+                res = record.reap_orphan(
+                    self.core.Api, self.cookies, self.userid, otid,
+                    start_time=int(info.get("startTime") or 0),
+                    log=self.log_event, **self.recovery_args(marker, otid))
+                self.emit(type="reconciled", otid=otid, stopped=True,
+                          keptSpool=str(res.get("keptSpool") or ""),
+                          recoveredSec=self.seconds(
+                              res.get("replayedBytes") or 0))
             except Exception as e:
                 _cls, msg = classify_error(e)
                 self.log_event("reap_failed", otid=otid, error=msg)

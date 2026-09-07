@@ -1385,12 +1385,23 @@ class TestReapOrphan(unittest.TestCase):
 
         def __init__(self):
             self.sent = []
+            self.binary = []
+            # Text and binary interleaved by kind, so a test can assert that
+            # audio went out *before* the stop frame rather than after it.
+            self.order = []
             self.closed = False
             SpyWs = type(self)
             SpyWs.instances.append(self)
 
         def send_text(self, text):
-            self.sent.append(_json.loads(text))
+            frame = _json.loads(text)
+            self.sent.append(frame)
+            self.order.append(frame.get("action", "text"))
+
+        def send_binary(self, data):
+            self.binary.append(data)
+            if "binary" not in self.order:
+                self.order.append("binary")
 
         def close(self, code=1000):
             self.closed = True
@@ -1774,6 +1785,182 @@ class TestOrphanedDaemon(unittest.TestCase):
         handler(signal.SIGTERM, None)
         self.assertFalse(server.running)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+class TestReapReplay(unittest.TestCase):
+    """Recovering the audio a killed helper never got onto the wire."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="otter_replay_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def spool(self, nbytes):
+        path = os.path.join(self.dir, "orphan.pcm")
+        with open(path, "wb") as fh:
+            fh.write(bytes(range(256)) * (nbytes // 256 + 1))
+            fh.truncate(nbytes)
+        return path
+
+    def reap(self, spool_path="", acked=-1, ws=None):
+        api = TestReapOrphan.RecordingApi()
+        sock = ws or TestReapOrphan.SpyWs()
+        with mock.patch.object(record, "REAP_SETTLE_SEC", 0), \
+             mock.patch.object(wsclient.WebSocket, "connect",
+                               classmethod(lambda cls, *a, **k: sock)):
+            res = record.reap_orphan(api, {}, "42", "otid-orphan",
+                                     start_time=1, spool_path=spool_path,
+                                     acked=acked)
+        return sock, res
+
+    def test_the_unsent_tail_is_replayed(self):
+        path = self.spool(record.FRAME_BYTES * 3)
+        sock, res = self.reap(path, acked=record.FRAME_BYTES)
+        self.assertEqual(res["unsentBytes"], record.FRAME_BYTES * 2)
+        self.assertEqual(res["replayedBytes"], record.FRAME_BYTES * 2)
+        self.assertEqual(sum(len(b) for b in sock.binary),
+                         record.FRAME_BYTES * 2)
+
+    def test_the_replay_resumes_from_the_acked_offset(self):
+        # The offset declared and the file position replayed from come from
+        # the same number, so a stale marker duplicates rather than drops.
+        path = self.spool(record.FRAME_BYTES * 2)
+        with open(path, "rb") as fh:
+            fh.seek(record.FRAME_BYTES)
+            expected = fh.read()  # read first: a full replay deletes the spool
+        sock, _res = self.reap(path, acked=record.FRAME_BYTES)
+        start = sock.sent[0]
+        self.assertEqual(start["action"], "start")
+        self.assertEqual(start["offset"],
+                         record.FRAME_BYTES // audio.SAMPLE_WIDTH)
+        self.assertEqual(b"".join(sock.binary), expected)
+
+    def test_audio_goes_out_before_the_stop(self):
+        path = self.spool(record.FRAME_BYTES)
+        sock, _res = self.reap(path, acked=0)
+        self.assertEqual([f["action"] for f in sock.sent], ["start", "stop"])
+        self.assertTrue(sock.binary)
+        self.assertLess(sock.order.index("binary"), sock.order.index("stop"))
+
+    def test_a_fully_replayed_spool_is_deleted(self):
+        path = self.spool(record.FRAME_BYTES)
+        _sock, res = self.reap(path, acked=0)
+        self.assertEqual(res["keptSpool"], "")
+        self.assertFalse(os.path.exists(path))
+
+    def test_an_unknown_offset_replays_nothing_and_keeps_the_spool(self):
+        # A live speech we own but have no marker for: guessing an offset
+        # would either duplicate audio or silently drop it.
+        path = self.spool(record.FRAME_BYTES * 2)
+        sock, res = self.reap(path, acked=-1)
+        self.assertEqual(res["replayedBytes"], 0)
+        self.assertEqual(sock.binary, [])
+        self.assertEqual(res["keptSpool"], path)
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_spool_otter_already_has_in_full_is_deleted(self):
+        path = self.spool(record.FRAME_BYTES)
+        _sock, res = self.reap(path, acked=record.FRAME_BYTES)
+        self.assertEqual(res["unsentBytes"], 0)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_failed_replay_still_closes_the_session(self):
+        # Closing the session matters even when the audio cannot be saved:
+        # a speech left live blocks the next recording.
+        class Deaf(TestReapOrphan.SpyWs):
+            def send_binary(self, data):
+                raise RuntimeError("socket full")
+
+        path = self.spool(record.FRAME_BYTES * 2)
+        sock, res = self.reap(path, acked=0, ws=Deaf())
+        self.assertIn("socket full", res["replayError"])
+        self.assertTrue(res["stopped"])
+        self.assertEqual([f["action"] for f in sock.sent], ["start", "stop"])
+        self.assertEqual(res["keptSpool"], path)
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_vanished_spool_is_not_fatal(self):
+        _sock, res = self.reap(os.path.join(self.dir, "gone.pcm"), acked=0)
+        self.assertTrue(res["stopped"])
+        self.assertEqual(res["replayedBytes"], 0)
+
+    def test_the_replay_is_bounded(self):
+        path = self.spool(record.FRAME_BYTES * 50)
+        sock = TestReapOrphan.SpyWs()
+        with mock.patch.object(record, "REAP_SETTLE_SEC", 0), \
+             mock.patch.object(record, "REPLAY_TIMEOUT_SEC", -1), \
+             mock.patch.object(wsclient.WebSocket, "connect",
+                               classmethod(lambda cls, *a, **k: sock)):
+            res = record.reap_orphan(TestReapOrphan.RecordingApi(), {}, "42",
+                                     "o", spool_path=path, acked=0)
+        self.assertEqual(res["replayedBytes"], 0)
+        self.assertTrue(res["stopped"])
+        self.assertTrue(os.path.exists(path))
+
+
+class TestRecoveryArgs(SingleFlightBase):
+    """Which stranded recordings can be replayed, and which only closed."""
+
+    def test_the_marker_supplies_the_offset(self):
+        server = self.make()
+        self.spool(server, "otid-a")
+        args = server.recovery_args({"otid": "otid-a", "acked": 4096},
+                                    "otid-a")
+        self.assertEqual(args["acked"], 4096)
+        self.assertTrue(args["spool_path"].endswith("otid-a.pcm"))
+
+    def test_a_marker_for_another_recording_gives_no_offset(self):
+        server = self.make()
+        self.spool(server, "otid-b")
+        args = server.recovery_args({"otid": "otid-a", "acked": 4096},
+                                    "otid-b")
+        self.assertEqual(args["acked"], -1)
+
+    def test_no_marker_gives_no_offset(self):
+        server = self.make()
+        self.spool(server, "otid-b")
+        self.assertEqual(server.recovery_args(None, "otid-b")["acked"], -1)
+
+    def test_no_spool_means_nothing_to_recover(self):
+        server = self.make()
+        self.assertEqual(server.recovery_args({"otid": "x", "acked": 1}, "x"),
+                         {})
+
+    def test_a_corrupt_offset_falls_back_to_the_start(self):
+        server = self.make()
+        self.spool(server, "otid-a")
+        args = server.recovery_args({"otid": "otid-a", "acked": "nonsense"},
+                                    "otid-a")
+        self.assertEqual(args["acked"], 0)
+
+    def test_reconcile_reports_what_it_recovered(self):
+        server = self.make(live=[{"otid": "orphan-1"}])
+        self.spool(server, "orphan-1")
+        record.write_active(self.core.STATE_DIR,
+                            {"otid": "orphan-1", "pid": 999999999,
+                             "acked": 0})
+        self.patch_reap.stop()
+        with mock.patch.object(record, "reap_orphan", return_value={
+                "otid": "orphan-1", "stopped": True, "keptSpool": "",
+                "unsentBytes": 320000, "replayedBytes": 320000,
+                "url": ""}):
+            server.reconcile()
+        self.patch_reap.start()
+        frame = self.frames("reconciled")[0]
+        self.assertEqual(frame["recoveredSec"], 10.0)
+        self.assertEqual(frame["keptSpool"], "")
+
+    def test_reconcile_names_the_audio_it_could_not_upload(self):
+        server = self.make(live=[{"otid": "orphan-1"}])
+        self.spool(server, "orphan-1")
+        self.patch_reap.stop()
+        with mock.patch.object(record, "reap_orphan", return_value={
+                "otid": "orphan-1", "stopped": True,
+                "keptSpool": "/tmp/orphan-1.pcm",
+                "unsentBytes": 320000, "replayedBytes": 0, "url": ""}):
+            server.reconcile()
+        self.patch_reap.start()
+        self.assertTrue(any("10.0s" in e.get("message", "")
+                            for e in self.frames("error")))
 
 
 if __name__ == "__main__":

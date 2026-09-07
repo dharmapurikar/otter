@@ -143,6 +143,64 @@ The extension mixes tab-capture audio with an optional microphone stream
 before the worklet. A native client mixes PipeWire sources instead, and can
 take the *system output monitor* — strictly more than Chrome can capture.
 
+## Live sessions, and reaping the strays
+
+Verified 2026-09-07 by starting a real recording and watching it, then by
+abandoning one deliberately.
+
+A recording in progress reports:
+
+| Field | Live | Finished | Opened, never fed |
+|---|---|---|---|
+| `live_status` | `live` | `none` | `none` |
+| `speech_processing_state` | `RECORDING` | `ALL_DONE` | `UNSPECIFIED` |
+| `process_finished` | `false` | `true` | `false` |
+| `end_time` | `0` | `0` | `0` |
+
+Both discriminating fields appear on the **home feed** serializer as well, so
+enumerating live sessions costs no extra call. `process_finished` is `null` in
+the feed and only filled in by `GET speech?otid=`. The flip happens within
+~2 s of a clean stop.
+
+**`end_time` is not a liveness signal.** It reads `0` on every speech in both
+serializers, finished or not. Reading it as one calls the whole account live.
+
+Three findings that shape how a stray is cleaned up:
+
+1. **An abandoned speech stays live forever.** Drop the socket without a stop
+   frame and it still reports `live_status: live` indefinitely — measured well
+   past the point any timeout would have fired. It does not self-close.
+2. **`speech_finish` does not end a session.** The call answers `OK` and the
+   speech carries on `RECORDING`. Finish is metadata; the websocket
+   `{"action":"stop"}` frame is the stop.
+3. **The stop frame is ignored on an unbound socket.** Reconnecting and
+   sending only `stop` left the speech live. The socket must first be bound
+   with `{"action":"start", speech_id, offset}`.
+
+And the one that makes recovery possible at all:
+
+**`speech_start` is idempotent on `otid`.** Hand it an otid that already
+exists and it returns the *same* `speech_id` with a fresh record-scoped
+`ws_url` (the JWT carries `"permission":"record"` and that `speech_id`). So an
+orphan can be adopted from nothing but its otid — no need to have persisted a
+socket URL or token:
+
+```
+POST speech_start?...&otid=<existing otid>   → same speech_id, new ws_url
+ws:  {"action":"start","speech_id":…,"offset":<acked samples>}
+ws:  <replay whatever the spool still holds>
+ws:  {"action":"stop","speech_id":…}
+POST speech_finish
+→ live_status live → none, RECORDING → ALL_DONE
+```
+
+Only ever do this to a speech confirmed live. Re-opening a *finished* one puts
+it back into `RECORDING`, which is worse than the orphan.
+
+`helper/otter.py live` lists live sessions and `helper/otter.py reap [otid…|
+--all]` closes them; the daemon does the same sweep on startup and before
+every start (see ARCHITECTURE.md, "One recording at a time").
+
 ## Live transcript: subscribe protocol
 
 `GET speech?otid=<otid>` returns `{"speech": {...}}`. Verified live; the
@@ -154,7 +212,7 @@ fields that matter:
 | `speech_id` | a short internal id such as `2OQUSKHEHMKZFAXV` — **not** the otid |
 | `pubsub_v2_index` | often `null`; omit the `index` param when it is |
 | `transcripts[]` | what already exists, useful for seeding |
-| `live_status`, `end_time` | whether it is still running |
+| `live_status`, `speech_processing_state` | whether it is still running — **not** `end_time`, see below |
 
 A transcript segment carries `uuid`, `sig`, `start_offset`, `end_offset`,
 `speaker_id`, `speaker_model_label`, a convenience `transcript` string, and

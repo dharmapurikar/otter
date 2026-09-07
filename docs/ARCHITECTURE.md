@@ -373,7 +373,57 @@ limited to a single tab; PipeWire gives us the whole system.
 | `~/.config/omarchy/plugins/io.github.dharmapurikar.otter/` | user | the installed plugin, keyed by id |
 | `~/.local/state/omarchy/otter/session.json` | helper | cached cookies + userid, `0600` |
 | `~/.local/state/omarchy/otter/recordings/` | helper | append-only PCM spool per recording; kept only when audio never reached the wire |
+| `~/.local/state/omarchy/otter/active.json` | helper | the recording in progress: otid, speech id, owning pid, acked offset. `0600`, written atomically |
+| `~/.local/state/omarchy/otter/autostart.json` | helper | last meeting auto-recorded, for the cooldown |
 | `~/.config/omarchy/shell.json` | shell | the widget's layout entry + its settings |
+
+## One recording at a time
+
+A helper killed mid-recording leaves its speech live on Otter **forever** — it
+does not self-close (see PROTOCOL.md, "Live sessions"). A fresh helper starts
+with no memory, and the first thing it does is tell MeetingWatch which apps
+hold a microphone; if a call is still up, MeetingWatch reads that as a brand
+new join and starts recording. Put those together and one shell restart during
+a meeting produces two live sessions, two restarts produce three, and nothing
+ever closes any of them. That happened: five recordings in ninety seconds,
+four still live afterwards.
+
+Four independent guards, deliberately overlapping, because the failure was
+cheap to cause and expensive to notice:
+
+1. **The marker.** `active.json` names the recording in progress and the pid
+   that owns it, written atomically the moment the speech exists and refreshed
+   with the acked offset on the same minute cadence as the health line. Its one
+   reader is a process that exists *because* the writer was killed.
+2. **Reconcile on startup.** Before the mic watch says a word, the helper
+   reads the marker and sweeps the feed for live speeches. Anything live with a
+   spool file on disk is ours and gets closed; anything live without one
+   belongs to somebody else — the web app, a phone, OtterPilot — and is only
+   reported. A sweep that cannot run (no session, no network) leaves the gate
+   shut rather than concluding the world is clean, and retries on the next
+   successful refresh. Nothing may auto-start until it has run.
+3. **The start guard.** Every start re-sweeps. A live session that is not ours
+   refuses the start and names it; one that is ours is closed first. A sweep
+   that fails waves an explicit start through — a duplicate recording is
+   recoverable, a meeting nobody recorded is not. A marker held by a *living*
+   helper (two panels, or a restart that outran its predecessor) stands this
+   one down entirely.
+4. **Not dying badly in the first place.** SIGTERM, SIGINT and SIGHUP now run
+   the graceful shutdown, which drains, sends the stop frame, posts
+   `speech_finish` and clears the marker. A helper whose shell exited notices
+   the reparenting and does the same, instead of lingering with the microphone
+   open. SIGKILL remains uncatchable, which is what guards 1–3 are for.
+
+Plus a cooldown, because MeetingWatch's own amnesia is the trigger: an
+automatic start records where it happened, so the same meeting cannot be
+auto-recorded twice within 90 s however many times the shell restarts. An
+explicit click is never subject to it — a person asking to record always wins.
+
+A start the helper declines this way answers `start_failed` with
+`errorClass: "suppressed"`. The frame still has to go out so the widget's
+pending flag clears, but the panel paints no error text and the toast says
+"Not started" rather than "Recording failed": a decision of ours is not a
+fault.
 
 ## Mapping to the Omarchy plugin system
 

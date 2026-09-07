@@ -19,6 +19,7 @@ import struct
 import sys
 import tempfile
 import shutil
+import signal
 import time
 import unittest
 from unittest import mock
@@ -828,6 +829,23 @@ class StubCore:
             raise RuntimeError(self._fail)
         return self._recent[:n]
 
+    # ---- live sessions ------------------------------------------------
+    # `live` is the feed's answer; `sweep_error` makes the sweep fail the
+    # way a flaky network does, which must never block recording.
+    live: list = []
+    sweep_error = ""
+    states: dict = {}
+
+    is_live = staticmethod(core.is_live)
+
+    def live_speeches(self, cookies):
+        if self.sweep_error:
+            raise RuntimeError(self.sweep_error)
+        return list(self.live)
+
+    def speech_state(self, cookies, otid):
+        return dict(self.states.get(otid) or {})
+
 
 class NetworkFailCore(StubCore):
     """Auth is fine; the network is not."""
@@ -1082,6 +1100,9 @@ class TestEventLog(unittest.TestCase):
             def note_default(self, source):
                 pass
 
+            def mark_active(self):
+                self.marked = True
+
         server.recorder = FakeRecorder()
         with mock.patch.object(audio, "mic_captures", return_value=[]), \
              mock.patch.object(audio, "default_source",
@@ -1226,6 +1247,533 @@ class TestConfirmedCommands(unittest.TestCase):
         failed = next(e for e in emitted if e["type"] == "stop_failed")
         self.assertEqual(failed["errorClass"], "internal")
         self.assertIn("upload broke mid-stream", failed["message"])
+
+
+class TestLiveSweep(unittest.TestCase):
+    """The liveness predicate, against the shapes Otter actually returns.
+
+    Every row here was observed on a real account (2026-09-07): a recording
+    in progress, the same conversation two seconds after a clean stop, and a
+    speech that was opened but never fed any audio.
+    """
+
+    def test_recording_speech_is_live(self):
+        self.assertTrue(core.is_live(
+            {"live_status": "live", "speech_processing_state": "RECORDING"}))
+
+    def test_either_field_alone_is_enough(self):
+        self.assertTrue(core.is_live({"live_status": "live"}))
+        self.assertTrue(core.is_live({"speech_processing_state": "RECORDING"}))
+
+    def test_finished_speech_is_not_live(self):
+        self.assertFalse(core.is_live(
+            {"live_status": "none", "speech_processing_state": "ALL_DONE",
+             "process_finished": True}))
+
+    def test_never_started_speech_is_not_live(self):
+        self.assertFalse(core.is_live(
+            {"live_status": "none", "speech_processing_state": "UNSPECIFIED",
+             "process_finished": False}))
+
+    def test_end_time_zero_does_not_imply_live(self):
+        # end_time reads 0 on every speech, finished or not. Reading it as a
+        # liveness signal would call the entire account live.
+        self.assertFalse(core.is_live(
+            {"end_time": 0, "live_status": "none",
+             "speech_processing_state": "ALL_DONE"}))
+
+    def test_junk_is_not_live(self):
+        for junk in (None, "", 3, [], {}):
+            self.assertFalse(core.is_live(junk))
+
+
+class TestActiveMarker(unittest.TestCase):
+    """The on-disk record of a live recording."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="otter_marker_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_round_trip(self):
+        record.write_active(self.dir, {"otid": "abc", "pid": 42, "acked": 99})
+        got = record.read_active(self.dir)
+        self.assertEqual(got["otid"], "abc")
+        self.assertEqual(got["acked"], 99)
+
+    def test_absent_marker_reads_none(self):
+        self.assertIsNone(record.read_active(self.dir))
+
+    def test_marker_without_otid_is_not_a_marker(self):
+        record.write_active(self.dir, {"pid": 7})
+        self.assertIsNone(record.read_active(self.dir))
+
+    def test_unreadable_marker_reads_none(self):
+        with open(record.active_path(self.dir), "w") as fh:
+            fh.write("{ this is not json")
+        self.assertIsNone(record.read_active(self.dir))
+
+    def test_clear_is_idempotent(self):
+        record.write_active(self.dir, {"otid": "abc"})
+        record.clear_active(self.dir)
+        record.clear_active(self.dir)
+        self.assertIsNone(record.read_active(self.dir))
+
+    def test_no_partial_marker_is_ever_visible(self):
+        # The reader is a daemon that exists because the writer was killed,
+        # so a half-written marker is precisely the case that must not occur.
+        record.write_active(self.dir, {"otid": "a" * 4000, "pid": 1})
+        self.assertEqual(len(record.read_active(self.dir)["otid"]), 4000)
+        self.assertFalse(os.path.exists(record.active_path(self.dir) + ".tmp"))
+
+    def test_own_pid_is_alive_and_a_helper(self):
+        # This test process is not otter.py, so the cmdline check must
+        # refuse it even though the pid is very much alive.
+        self.assertFalse(record.pid_alive(os.getpid()))
+
+    def test_dead_and_nonsense_pids_are_not_alive(self):
+        for pid in (0, 1, -5, None, "x", 999999999):
+            self.assertFalse(record.pid_alive(pid))
+
+    def test_recorder_writes_and_clears_the_marker(self):
+        spool_dir = os.path.join(self.dir, "recordings")
+        os.makedirs(spool_dir, exist_ok=True)
+        rec = record.Recorder(api=FakeApi(), cookies={}, userid="1",
+                              spool_dir=spool_dir, state_dir=self.dir)
+        rec.otid = "otid-live"
+        rec.speech_id = "sp-1"
+        rec.started_at = 1000
+        rec._spool = record.Spool(os.path.join(spool_dir, "otid-live.pcm"))
+        rec.mark_active()
+        marker = record.read_active(self.dir)
+        self.assertEqual(marker["otid"], "otid-live")
+        self.assertEqual(marker["pid"], os.getpid())
+
+        rec._ws = FakeWs()
+        rec.finish()
+        self.assertIsNone(record.read_active(self.dir))
+
+    def test_state_dir_defaults_to_the_spool_parent(self):
+        rec = record.Recorder(api=FakeApi(), cookies={}, userid="1",
+                              spool_dir=os.path.join(self.dir, "recordings"))
+        self.assertEqual(rec.state_dir, self.dir)
+
+
+class TestReapOrphan(unittest.TestCase):
+    """Closing a live speech nobody owns any more.
+
+    The ordering asserted here is not stylistic. Measured against the real
+    API: `speech_finish` alone leaves the speech RECORDING, and a stop frame
+    on a socket that was never bound by a preceding `start` is ignored. Both
+    have to happen, in that order, or the orphan stays live.
+    """
+
+    class RecordingApi:
+        def __init__(self, ws_url="wss://ws.example/x", speech_id="sp-9"):
+            self.calls = []
+            self._ws_url = ws_url
+            self._speech_id = speech_id
+
+        def post(self, endpoint, cookies, params=None, data=None):
+            self.calls.append((endpoint, params or data or {}))
+            if endpoint == "speech_start":
+                return {"ws_url": self._ws_url, "speech_id": self._speech_id,
+                        "otid": (params or {}).get("otid", "")}
+            return {}
+
+    class SpyWs:
+        instances: list = []
+
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+            SpyWs = type(self)
+            SpyWs.instances.append(self)
+
+        def send_text(self, text):
+            self.sent.append(_json.loads(text))
+
+        def close(self, code=1000):
+            self.closed = True
+
+    def reap(self, api=None, **kw):
+        api = api or self.RecordingApi()
+        type(self).SpyWs.instances = []
+        with mock.patch.object(record, "REAP_SETTLE_SEC", 0), \
+             mock.patch.object(wsclient.WebSocket, "connect",
+                               classmethod(lambda cls, *a, **k: self.SpyWs())):
+            res = record.reap_orphan(api, {}, "42", "otid-orphan",
+                                     start_time=1700000000, **kw)
+        return api, res
+
+    def test_reissues_the_socket_from_the_otid_alone(self):
+        api, res = self.reap()
+        endpoints = [c[0] for c in api.calls]
+        self.assertEqual(endpoints, ["speech_start", "speech_finish"])
+        # The otid is handed back to speech_start: that idempotence is what
+        # makes an orphan recoverable without a persisted ws_url or token.
+        self.assertEqual(api.calls[0][1]["otid"], "otid-orphan")
+        self.assertTrue(res["stopped"])
+
+    def test_binds_the_socket_before_stopping_it(self):
+        self.reap()
+        sent = self.SpyWs.instances[0].sent
+        self.assertEqual([f["action"] for f in sent], ["start", "stop"])
+        self.assertEqual(sent[0]["speech_id"], "sp-9")
+        self.assertEqual(sent[1]["speech_id"], "sp-9")
+
+    def test_closes_the_socket_even_when_the_stop_frame_fails(self):
+        class Exploding(self.SpyWs):
+            def send_text(self, text):
+                raise RuntimeError("socket gone")
+
+        with mock.patch.object(record, "REAP_SETTLE_SEC", 0), \
+             mock.patch.object(wsclient.WebSocket, "connect",
+                               classmethod(lambda cls, *a, **k: Exploding())):
+            res = record.reap_orphan(self.RecordingApi(), {}, "42", "o",
+                                     start_time=1)
+        self.assertFalse(res["stopped"])
+        self.assertIn("socket gone", res["stopError"])
+
+    def test_still_finishes_when_the_socket_will_not_open(self):
+        api = self.RecordingApi()
+        with mock.patch.object(wsclient.WebSocket, "connect",
+                               classmethod(lambda cls, *a, **k:
+                                           (_ for _ in ()).throw(
+                                               OSError("refused")))):
+            res = record.reap_orphan(api, {}, "42", "o", start_time=1)
+        self.assertFalse(res["stopped"])
+        self.assertIn("refused", res["stopError"])
+        self.assertIn("speech_finish", [c[0] for c in api.calls])
+
+    def test_refuses_without_an_otid(self):
+        with self.assertRaises(record.RecordError):
+            record.reap_orphan(self.RecordingApi(), {}, "42", "")
+
+    def test_refuses_when_no_socket_comes_back(self):
+        class NoWs(self.RecordingApi):
+            def post(self, endpoint, cookies, params=None, data=None):
+                return {}
+
+        with self.assertRaises(record.RecordError):
+            record.reap_orphan(NoWs(), {}, "42", "o")
+
+
+class SweepCore(StubCore):
+    """A StubCore with its own state dir, so tests cannot see each other's
+    markers, spools or cooldown stamps."""
+
+    def __init__(self, recent=None, fail=None, live=None, sweep_error="",
+                 states=None):
+        super().__init__(recent=recent, fail=fail)
+        self.STATE_DIR = tempfile.mkdtemp(prefix="otter_sweep_")
+        self.live = list(live or [])
+        self.sweep_error = sweep_error
+        self.states = dict(states or {})
+
+
+class SingleFlightBase(unittest.TestCase):
+    def make(self, core=None, **kw):
+        import serve
+        self.core = core or SweepCore(**kw)
+        self.addCleanup(shutil.rmtree, self.core.STATE_DIR, ignore_errors=True)
+        server = serve.Server(self.core, Args())
+        self.emitted = []
+        server.emit = lambda **k: self.emitted.append(k)
+        self.reaped = []
+
+        def spy_reap(api, cookies, userid, otid, start_time=0, log=None,
+                     **kw):
+            self.reaped.append(otid)
+            return {"otid": otid, "stopped": True, "stopError": "",
+                    "finishError": "", "url": ""}
+
+        self.patch_reap = mock.patch.object(record, "reap_orphan", spy_reap)
+        self.patch_reap.start()
+        self.addCleanup(self.patch_reap.stop)
+        return server
+
+    def spool(self, server, otid):
+        """Give a conversation a spool file: the ownership receipt."""
+        os.makedirs(server.spool_dir, exist_ok=True)
+        path = os.path.join(server.spool_dir, f"{otid}.pcm")
+        with open(path, "wb") as fh:
+            fh.write(b"\x00" * 64)
+        return path
+
+    def frames(self, kind):
+        return [e for e in self.emitted if e.get("type") == kind]
+
+    def types(self):
+        return [e.get("type") for e in self.emitted]
+
+
+class TestReconcile(SingleFlightBase):
+    """What a fresh daemon does about what its predecessor left behind."""
+
+    def test_clean_start_reconciles_immediately(self):
+        server = self.make()
+        server.reconcile()
+        self.assertTrue(server.reconciled)
+        self.assertEqual(self.reaped, [])
+        self.assertEqual(server.foreign_live, [])
+        self.assertTrue(self.frames("state"))
+
+    def test_our_stranded_recording_is_closed(self):
+        server = self.make(live=[{"otid": "orphan-1", "startTime": 1700}])
+        self.spool(server, "orphan-1")
+        server.reconcile()
+        self.assertEqual(self.reaped, ["orphan-1"])
+        self.assertTrue(self.frames("reconciled")[0]["stopped"])
+        self.assertTrue(server.reconciled)
+
+    def test_somebody_elses_live_session_is_left_alone(self):
+        # No spool file: this is the web app, a phone, or OtterPilot sitting
+        # in a meeting. Closing it would be us stopping someone's recording.
+        server = self.make(live=[{"otid": "not-ours", "startTime": 1700}])
+        server.reconcile()
+        self.assertEqual(self.reaped, [])
+        self.assertEqual(server.foreign_live, ["not-ours"])
+
+    def test_a_marker_still_held_by_a_live_daemon_stands_down(self):
+        server = self.make()
+        with mock.patch.object(record, "pid_alive", return_value=True):
+            record.write_active(self.core.STATE_DIR,
+                                {"otid": "held", "pid": 4242})
+            server.reconcile()
+        self.assertEqual(server.blocked_by_pid, 4242)
+        self.assertEqual(self.reaped, [])
+        # And it says so, because "start does nothing" with no reason given
+        # is the worst version of this.
+        self.assertTrue(any("already recording" in e.get("message", "")
+                            for e in self.frames("error")))
+
+    def test_a_marker_whose_speech_fell_off_the_feed_is_probed(self):
+        server = self.make(live=[], states={
+            "stale": {"live_status": "live", "start_time": 99}})
+        record.write_active(self.core.STATE_DIR,
+                            {"otid": "stale", "pid": 999999999})
+        server.reconcile()
+        self.assertEqual(self.reaped, ["stale"])
+
+    def test_a_finished_speech_is_never_reopened(self):
+        # Re-opening a finished speech puts it back into RECORDING, which is
+        # worse than the orphan. A marker left over from a clean stop must
+        # therefore be dropped, not reaped.
+        server = self.make(live=[], states={
+            "done": {"live_status": "none",
+                     "speech_processing_state": "ALL_DONE"}})
+        record.write_active(self.core.STATE_DIR,
+                            {"otid": "done", "pid": 999999999})
+        server.reconcile()
+        self.assertEqual(self.reaped, [])
+        self.assertTrue(server.reconciled)
+
+    def test_the_marker_is_cleared_once_reconciled(self):
+        server = self.make(live=[{"otid": "orphan-1"}])
+        self.spool(server, "orphan-1")
+        record.write_active(self.core.STATE_DIR,
+                            {"otid": "orphan-1", "pid": 999999999})
+        server.reconcile()
+        self.assertIsNone(record.read_active(self.core.STATE_DIR))
+
+    def test_a_failed_sweep_defers_rather_than_assuming_clean(self):
+        # Concluding "nothing is live" without having asked is the entire
+        # bug, so a sweep that could not run leaves the gate shut.
+        server = self.make(sweep_error="request timed out")
+        server.reconcile()
+        self.assertFalse(server.reconciled)
+        self.assertTrue(server._reconcile_pending)
+        self.assertTrue(self.frames("state"))
+
+    def test_a_reap_that_fails_is_reported_not_swallowed(self):
+        server = self.make(live=[{"otid": "orphan-1"}])
+        self.spool(server, "orphan-1")
+        self.patch_reap.stop()
+        with mock.patch.object(record, "reap_orphan",
+                               side_effect=RuntimeError("ws refused")):
+            server.reconcile()
+        self.patch_reap.start()
+        self.assertFalse(self.frames("reconciled")[0]["stopped"])
+        self.assertTrue(any("still live" in e.get("message", "")
+                            for e in self.frames("error")))
+        # Still reconciled: the gate opens so a click can record, and the
+        # stray is named rather than blocking the plugin forever.
+        self.assertTrue(server.reconciled)
+
+    def test_reap_is_bounded(self):
+        import serve
+        live = [{"otid": f"orphan-{i}"} for i in range(serve.MAX_REAP + 3)]
+        server = self.make(live=live)
+        for s in live:
+            self.spool(server, s["otid"])
+        server.reconcile()
+        self.assertEqual(len(self.reaped), serve.MAX_REAP)
+
+    def test_state_reports_the_gate(self):
+        server = self.make()
+        server.reconcile()
+        state = self.frames("state")[-1]
+        self.assertTrue(state["reconciled"])
+        self.assertEqual(state["otherDaemonPid"], 0)
+        self.assertEqual(state["foreignLive"], [])
+
+
+class TestStartGuard(SingleFlightBase):
+    """Every reason a start does not happen, and every reason it must."""
+
+    def ready(self, **kw):
+        server = self.make(**kw)
+        server.reconcile()
+        self.emitted.clear()
+        return server
+
+    def test_a_clean_start_is_allowed(self):
+        server = self.ready()
+        self.assertTrue(server.guard_start({}))
+
+    def test_auto_start_waits_for_the_sweep(self):
+        # The incident in one assertion: a fresh daemon reports an
+        # in-progress call, MeetingWatch reads it as a new join, and asks to
+        # record. Before the sweep has run, the answer is no.
+        server = self.make(sweep_error="no session")
+        server.reconcile()
+        self.emitted.clear()
+        self.assertFalse(server.guard_start({"auto": True, "label": "Teams"}))
+        self.assertEqual(self.frames("start_failed")[0]["errorClass"],
+                         "suppressed")
+        # Suppressed on purpose, so no red error text in the panel.
+        self.assertEqual(self.frames("error"), [])
+
+    def test_a_click_is_honoured_even_before_the_sweep(self):
+        server = self.make(sweep_error="no session")
+        server.reconcile()
+        self.emitted.clear()
+        self.assertTrue(server.guard_start({}))
+
+    def test_the_same_meeting_does_not_auto_start_twice(self):
+        server = self.ready()
+        server.stamp_autostart("Microsoft Teams")
+        self.assertFalse(server.guard_start(
+            {"auto": True, "label": "Microsoft Teams"}))
+        self.assertEqual(self.frames("start_failed")[0]["errorClass"],
+                         "suppressed")
+
+    def test_a_different_meeting_may_auto_start(self):
+        server = self.ready()
+        server.stamp_autostart("Microsoft Teams")
+        self.assertTrue(server.guard_start({"auto": True, "label": "Zoom"}))
+
+    def test_the_cooldown_expires(self):
+        import serve
+        server = self.ready()
+        server.stamp_autostart("Teams")
+        with mock.patch.object(serve.time, "time",
+                               return_value=time.time()
+                               + serve.AUTO_START_COOLDOWN_SEC + 1):
+            self.assertTrue(server.guard_start({"auto": True,
+                                                "label": "Teams"}))
+
+    def test_a_clock_that_jumped_backwards_does_not_lock_recording_out(self):
+        server = self.ready()
+        with open(server._autostart_path, "w") as fh:
+            _json.dump({"label": "Teams", "ts": time.time() + 86400}, fh)
+        self.assertTrue(server.guard_start({"auto": True, "label": "Teams"}))
+
+    def test_a_click_ignores_the_cooldown(self):
+        server = self.ready()
+        server.stamp_autostart("Teams")
+        self.assertTrue(server.guard_start({}))
+
+    def test_somebody_elses_live_session_refuses_a_start(self):
+        server = self.ready(live=[{"otid": "not-ours"}])
+        self.assertFalse(server.guard_start({}))
+        failed = self.frames("start_failed")[0]
+        self.assertEqual(failed["errorClass"], "otter-api")
+        self.assertIn("already has a recording", failed["message"])
+
+    def test_our_own_stray_is_closed_and_the_start_proceeds(self):
+        server = self.make(live=[{"otid": "stray"}])
+        self.spool(server, "stray")
+        server.reconcile()
+        self.core.live = [{"otid": "stray"}]  # still live at start time
+        self.reaped.clear()
+        self.emitted.clear()
+        self.assertTrue(server.guard_start({}))
+        self.assertEqual(self.reaped, ["stray"])
+
+    def test_a_flaky_sweep_never_costs_a_meeting(self):
+        # A duplicate recording is recoverable; a meeting nobody recorded is
+        # not. So a sweep that cannot run waves an explicit start through.
+        server = self.ready()
+        self.core.sweep_error = "request timed out"
+        self.assertTrue(server.guard_start({}))
+
+    def test_another_live_daemon_refuses_a_start(self):
+        server = self.ready()
+        server.blocked_by_pid = 4242
+        with mock.patch.object(record, "pid_alive", return_value=True):
+            self.assertFalse(server.guard_start({}))
+        self.assertIn("holds the recording",
+                      self.frames("start_failed")[0]["message"])
+
+    def test_a_daemon_that_has_since_died_stops_blocking(self):
+        server = self.ready()
+        server.blocked_by_pid = 4242
+        with mock.patch.object(record, "pid_alive", return_value=False):
+            self.assertTrue(server.guard_start({}))
+        self.assertEqual(server.blocked_by_pid, 0)
+
+    def test_a_finalizing_recording_refuses_a_start(self):
+        server = self.ready()
+        server.finalizing = object()
+        server.start({})
+        self.assertIn("still finishing",
+                      self.frames("start_failed")[0]["message"])
+
+
+class TestOrphanedDaemon(unittest.TestCase):
+    """A helper whose shell went away."""
+
+    def make(self):
+        import serve
+        core = SweepCore()
+        self.addCleanup(shutil.rmtree, core.STATE_DIR, ignore_errors=True)
+        server = serve.Server(core, Args())
+        self.emitted = []
+        server.emit = lambda **k: self.emitted.append(k)
+        return server
+
+    def test_reparenting_shuts_the_daemon_down(self):
+        # Left running, it holds the microphone *and* keeps a speech live
+        # while the shell's replacement starts a second one.
+        server = self.make()
+        server._parent = 424242
+        server._next_tick = 0
+        server.tick()
+        self.assertFalse(server.running)
+        self.assertTrue(any("shell exited" in e.get("message", "")
+                            for e in self.emitted))
+
+    def test_an_unchanged_parent_keeps_running(self):
+        server = self.make()
+        server._parent = os.getppid()
+        server._next_tick = 0
+        with mock.patch.object(audio, "mic_captures", return_value=[]), \
+             mock.patch.object(audio, "default_source", return_value=""):
+            server.tick()
+        self.assertTrue(server.running)
+
+    def test_signals_become_a_graceful_shutdown(self):
+        # SIGTERM used to end the process outright, so the finalize path
+        # never ran and the speech stayed live on Otter forever.
+        import serve
+        server = self.make()
+        server.install_signals()
+        handler = signal.getsignal(signal.SIGTERM)
+        self.assertTrue(callable(handler))
+        handler(signal.SIGTERM, None)
+        self.assertFalse(server.running)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 if __name__ == "__main__":

@@ -292,7 +292,7 @@ Panel {
     extraPatterns: String(root.setting("meetingPatterns", ""))
     recording: otter.recording || otter.finishing
     service: otter
-    onStartRequested: otter.startRecording()
+    onStartRequested: label => otter.startRecording(true, label)
     onStopRequested: otter.stopRecording()
   }
 
@@ -343,7 +343,7 @@ Panel {
     function refresh(): string { otter.refresh(); return "ok" }
     // Bind these for push-to-record without touching the mouse, e.g.
     //   bindd = SUPER ALT, R, Otter record, exec, omarchy-shell io.github.dharmapurikar.otter record
-    function record(): string { otter.startRecording(); return "ok" }
+    function record(): string { otter.startRecording(false, ""); return "ok" }
     function stop(): string { otter.stopRecording(); return "ok" }
     function recordToggle(): string { otter.toggleRecording(); return "ok" }
     // The countdown veto: clicking a countdown toast calls this.

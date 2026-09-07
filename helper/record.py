@@ -42,10 +42,178 @@ APP_ID = "chrome-ext-non-meeting"
 # "0s of audio" -- alarming, meaningless, and wrong. Half a second of slack
 # is well below anything a listener would notice missing.
 ACK_TOLERANCE_BYTES = (audio.SAMPLE_RATE * audio.SAMPLE_WIDTH) // 2
+# How long to let a reaped socket sit between its bind, its stop, and its
+# close. Sub-second waits were not tested; a second either side is cheap
+# against a path that runs once per crash and must actually land.
+REAP_SETTLE_SEC = 1.0
 
 
 class RecordError(Exception):
     pass
+
+
+# ------------------------------------------------- the active-recording marker
+
+# Where a live recording announces itself, so the *next* process can find it.
+# The whole point is to be readable by a daemon that exists only because this
+# one was killed, so it lives on disk and not in memory.
+ACTIVE_NAME = "active.json"
+
+
+def active_path(state_dir: str) -> str:
+    return os.path.join(state_dir, ACTIVE_NAME)
+
+
+def read_active(state_dir: str) -> dict | None:
+    try:
+        with open(active_path(state_dir)) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data.get("otid") else None
+
+
+def write_active(state_dir: str, data: dict) -> None:
+    """Record the live recording where a later process can find it.
+
+    Written atomically, because the only reader that matters is a daemon
+    started because this one died: a half-written marker is exactly the case
+    that must not happen.
+    """
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        tmp = active_path(state_dir) + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, active_path(state_dir))
+    except OSError:
+        pass  # a marker we could not write is not worth failing a start over
+
+
+def clear_active(state_dir: str) -> None:
+    try:
+        os.unlink(active_path(state_dir))
+    except OSError:
+        pass
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a pid is still running *and* is still a helper.
+
+    The pid alone is not enough. Pids get recycled, and mistaking an
+    unrelated process for a live daemon would refuse to record for as long
+    as that process lived -- a worse failure than the one being prevented.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False  # gone, or not ours to signal: either way not our daemon
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().decode("utf8", "replace")
+    except OSError:
+        return False
+    return "otter.py" in cmdline
+
+
+def reap_orphan(api, cookies: dict, userid: str, otid: str,
+                start_time: int = 0, log=None,
+                connect_timeout: float = 8.0) -> dict:
+    """End a live speech that nobody owns any more.
+
+    Three measured facts make this the shape it is:
+
+    * A speech whose socket dies without a `{"action":"stop"}` frame stays
+      `live_status: "live"` **indefinitely**. It does not time out.
+    * `POST speech_finish` alone does **not** end it. The call answers OK and
+      the speech carries on `RECORDING`; finish is metadata, the stop frame
+      is the stop.
+    * The stop frame is ignored on a socket that was not first bound by an
+      `{"action":"start"}` -- a bare reconnect-and-stop left the speech live.
+
+    And one that makes it possible at all: `speech_start` is **idempotent on
+    `otid`**. Handing it an otid that already exists returns the *same*
+    `speech_id` with a fresh record-scoped `ws_url`, so an orphan can be
+    adopted from nothing but its otid -- no socket URL or token to persist.
+
+    Only ever call this for a speech confirmed live. Re-opening a *finished*
+    one would put it back into RECORDING, which is worse than the orphan.
+    """
+    log = log or (lambda **kw: None)
+    if not otid:
+        raise RecordError("no otid to reap")
+
+    body = api.post("speech_start", cookies, params={
+        "appid": APP_ID,
+        "uuid": _uuid_hex(),
+        "userid": userid,
+        "start_time": str(int(start_time or time.time())),
+        "ignore_event": "true",
+        "otid": otid,
+    })
+    ws_url = str(body.get("ws_url") or "")
+    speech_id = str(body.get("speech_id") or "")
+    if not ws_url or not speech_id:
+        raise RecordError(f"speech_start did not re-issue a socket for {otid}")
+
+    stop_error = ""
+    sock = None
+    try:
+        sock = wsclient.WebSocket.connect(ws_url, timeout=connect_timeout)
+    except Exception as e:
+        stop_error = f"could not reopen the socket: {e}"
+    if sock:
+        try:
+            sock.send_text(json.dumps({
+                "action": "start", "speech_id": speech_id, "offset": 0,
+            }))
+            time.sleep(REAP_SETTLE_SEC)
+            sock.send_text(json.dumps({
+                "action": "stop", "speech_id": speech_id,
+            }))
+            time.sleep(REAP_SETTLE_SEC)
+        except Exception as e:
+            stop_error = f"stop frame failed: {e}"
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    end_time = int(time.time())
+    finish_error = ""
+    try:
+        api.post("speech_finish", cookies, data={
+            "appid": APP_ID,
+            "userid": userid,
+            "otid": otid,
+            "start_time": str(int(start_time or end_time)),
+            "end_time": str(end_time),
+        })
+    except Exception as e:
+        finish_error = str(e)
+
+    result = {
+        "otid": otid,
+        "speechId": speech_id,
+        "url": f"https://otter.ai/u/{otid}",
+        "stopped": not stop_error,
+        "stopError": stop_error,
+        "finishError": finish_error,
+    }
+    log(event="reap", **result)
+    return result
+
+
 
 
 def _uuid_hex() -> str:
@@ -100,11 +268,15 @@ class Recorder:
 
     def __init__(self, api, cookies: dict, userid: str, spool_dir: str,
                  mic_device: str = "", capture_system: bool = True,
-                 emit=None, log=None):
+                 emit=None, log=None, state_dir: str = ""):
         self.api = api
         self.cookies = cookies
         self.userid = userid
         self.spool_dir = spool_dir
+        # Where the active-recording marker goes. Defaults to the directory
+        # above the spool, which is the state dir the daemon already owns.
+        self.state_dir = state_dir or os.path.dirname(
+            os.path.abspath(spool_dir))
         self.mic_device = mic_device
         self.capture_system = capture_system
         self.emit = emit or (lambda **kw: None)
@@ -195,7 +367,31 @@ class Recorder:
         # replaces the mic, and the newcomer must prove itself afresh.
         self._mic_last_data = time.monotonic()
         self._tried = [self.mic_source] if self.mic_source else []
+        # Announce the recording before the first byte moves. If this process
+        # dies from here on, the next one can find the speech and close it.
+        self.mark_active()
         self._connect()
+
+    def mark_active(self) -> None:
+        """Publish (or refresh) the marker for this recording.
+
+        `acked` is what makes the marker worth refreshing: it is where a
+        later process resumes the upload from. It is only ever a lower
+        bound, and that is safe -- the offset we declare on reconnect and
+        the spool position we replay from come from this same number, so a
+        stale one re-sends audio Otter already has rather than skipping any.
+        """
+        write_active(self.state_dir, {
+            "otid": self.otid,
+            "speechId": self.speech_id,
+            "userid": self.userid,
+            "startTime": self.started_at,
+            "pid": os.getpid(),
+            "spool": self._spool.path if self._spool else "",
+            "acked": self._spool.acked if self._spool else 0,
+            "written": self._spool.written if self._spool else 0,
+            "updated": int(time.time()),
+        })
 
     def _connect(self) -> None:
         self._ws = wsclient.WebSocket.connect(self.ws_url, timeout=20.0)
@@ -724,6 +920,11 @@ class Recorder:
                 kept_path = self._spool.path
             self._spool.close(remove=(captured == 0) or complete)
             self._spool = None
+
+        # The speech is stopped either way -- the stop frame went out above --
+        # so the marker must go, or the next daemon will try to reap a
+        # conversation that is already closed.
+        clear_active(self.state_dir)
 
         self.result = {
             "otid": self.otid,

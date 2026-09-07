@@ -157,6 +157,8 @@ python3 helper/otter.py devices                    # PipeWire enumeration
 python3 helper/otter.py selftest --seconds 3       # capture only: no network,
                                                            # audio counted and discarded
 python3 helper/otter.py status --n 3               # live API (needs session)
+python3 helper/otter.py live                       # recordings Otter thinks are running
+python3 helper/otter.py reap --all                 # close strays (needs session)
 ```
 
 `qmllint` cannot resolve `qs.Commons` / `qs.Ui` without Quickshell's module

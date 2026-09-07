@@ -311,10 +311,16 @@ function reduce(state, event) {
     next.recording = false;
     if (state.starting) {
       next.starting = false;
+      // A start the helper deliberately suppressed is not a failure: it
+      // declined because something was already recording, or because a
+      // restart had just auto-started this same meeting. Saying "failed"
+      // there reads as a bug in the plugin rather than the plugin working.
+      var suppressed = String(ev.errorClass || "") === "suppressed";
       actions.push({
         type: "TOAST_OUTCOME",
-        headline: "Recording failed",
-        body: ev.friendlyError || ev.message || "Failed to start recording"
+        headline: suppressed ? "Not started" : "Recording failed",
+        body: ev.friendlyError || ev.message
+          || (suppressed ? "Already recording" : "Failed to start recording")
       });
     }
     break;

@@ -202,5 +202,30 @@ assertTrue(res.actions.some(a => a.type === "NOTE" && a.event === "countdown_can
   && a.fields.by === "cross-cancel"), "mode-cancel is logged as countdown_cancel");
 assertTrue(res.actions.some(a => a.type === "NOTE" && a.event === "mode_dropped_state"), "mode off drops state loudly");
 
+// 12. A start the helper suppressed on purpose is not a failure. It declines
+// when something is already recording, or when a restart just auto-started
+// this same meeting -- saying "Recording failed" there reads as a bug in the
+// plugin rather than the plugin doing its job.
+s = MS.initialState({ mode: "countdown" });
+s.starting = true;
+res = MS.reduce(s, {
+  type: "RECORDING_START_FAILED",
+  errorClass: "suppressed",
+  message: "Microsoft Teams was auto-recorded 12s ago; not starting a second recording"
+});
+s = res.state;
+eq(s.starting, false, "starting cleared on a suppressed start");
+assertTrue(res.actions.some(a => a.type === "TOAST_OUTCOME" && a.headline === "Not started"), "suppressed start is not called a failure");
+assertTrue(res.actions.some(a => a.type === "TOAST_OUTCOME" && a.body.includes("auto-recorded")), "suppressed start explains itself");
+
+// 13. The label travels with a start request, so the helper can hold a
+// per-meeting cooldown across its own restarts.
+s = MS.initialState({ mode: "countdown", countdownSec: 5 });
+res = MS.reduce(s, { type: "SCAN", toplevels: [meetCand], micCaptures: [] });
+s = res.state;
+eq(s.activeLabel, "Google Meet", "the active meeting is labelled for the cooldown");
+res = MS.reduce(s, { type: "COUNTDOWN_EXPIRED" });
+assertTrue(res.actions.some(a => a.type === "REQUEST_START"), "the countdown still asks to start");
+
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -8,7 +8,7 @@ exactly one place, so there are no locks and no races to reason about.
 Protocol (newline-delimited JSON both ways, see docs/ARCHITECTURE.md):
 
   in   {"cmd":"refresh"}
-       {"cmd":"start","micDevice":"","captureSystem":true}
+       {"cmd":"start","micDevice":"","captureSystem":true,"auto":false,"label":""}
        {"cmd":"stop"}
        {"cmd":"devices"}
        {"cmd":"transcript","otid":"..."}
@@ -27,6 +27,7 @@ Protocol (newline-delimited JSON both ways, see docs/ARCHITECTURE.md):
        {"type":"finishing","otid":"...","remaining":0.4}
        {"type":"live","otid":"...","text":"...","connected":true}
        {"type":"stopped","otid":"...","url":"...","duration":312}
+       {"type":"reconciled","otid":"...","stopped":true,"keptSpool":""}  # a stray live speech was closed
        {"type":"devices","devices":[...]}
        {"type":"transcript","otid":"...","text":"...","error":""}
        {"type":"summary","otid":"...","text":"...","error":""}
@@ -39,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import socket
 import stat
 import sys
@@ -63,6 +65,21 @@ EVENTS_LOG_MAX_BYTES = 512 * 1024
 # While recording, one health line per minute: elapsed, upload backlog
 # and the peak RMS seen -- the witness for "was the room really silent".
 HEALTH_LOG_SEC = 60.0
+
+# Reconciling is synchronous -- a socket per stray -- so it is bounded. Past
+# this many live speeches something is wrong that closing sockets will not
+# fix, and the panel should say so rather than hang on startup.
+MAX_REAP = 4
+# How long after an automatic start the same meeting may not auto-start
+# again, across daemon and shell restarts.
+#
+# This is the guard for the incident that produced all of this: a shell
+# restart hands MeetingWatch a fresh reducer, an in-progress call reads as a
+# brand-new join, and a new recording begins. It happened five times in
+# ninety seconds, once per restart, and four of the five recordings were
+# still live server-side when it was over.
+AUTO_START_COOLDOWN_SEC = 90.0
+AUTOSTART_NAME = "autostart.json"
 
 # How often to re-poll the conversation list while idle.
 DEFAULT_REFRESH_SEC = 300
@@ -170,6 +187,17 @@ class Server:
         self.mic_captures: list = []
         self._next_mic_check = 0.0
         self._events_path = os.path.join(core.STATE_DIR, EVENTS_LOG_NAME)
+        self._autostart_path = os.path.join(core.STATE_DIR, AUTOSTART_NAME)
+        # Whether the "is anything already recording?" sweep has run. Nothing
+        # may auto-start before it has: a fresh process has no idea what the
+        # process it replaced left behind.
+        self.reconciled = False
+        self._reconcile_pending = True
+        # Pid of another helper that holds the recording, if there is one.
+        self.blocked_by_pid = 0
+        # Live speeches that are not ours to touch (the web app, a phone,
+        # OtterPilot). Reported, never reaped.
+        self.foreign_live: list = []
 
     # ------------------------------------------------------------- output
 
@@ -195,6 +223,10 @@ class Server:
             # Being signed out is a state, not a fault. The panel already
             # shows a sign-in row, so it should not also show red error text.
             "needsLogin": self.needs_login,
+            # Whether a start is allowed to happen yet, and why not.
+            "reconciled": self.reconciled,
+            "otherDaemonPid": self.blocked_by_pid,
+            "foreignLive": self.foreign_live,
         }
         if self.recorder:
             payload["otid"] = self.recorder.otid
@@ -274,6 +306,11 @@ class Server:
                 pass
             self._auth_retry = min(AUTH_RETRY_MAX_SEC, self._auth_retry * 1.6)
         self._next_refresh = time.monotonic() + self.refresh_interval()
+        # A reconcile that could not run for want of a session gets its
+        # chance the moment one appears. Until then nothing may auto-start.
+        if self._reconcile_pending and self.authenticated and not self.recorder:
+            self.reconcile()
+            return
         self.emit_state()
 
     def refresh_interval(self) -> float:
@@ -383,10 +420,252 @@ class Server:
         except Exception as e:
             self.emit(type="summary", otid=otid, text="", error=str(e))
 
+    # -------------------------------------------------------- single flight
+
+    def owns(self, otid: str) -> bool:
+        """Whether a live speech is one of ours to clean up.
+
+        The spool file is the ownership receipt: finish() only deletes it
+        once Otter has everything, so a recording we started and lost still
+        has one. Anything else that is live -- the web app, a phone,
+        OtterPilot sitting in a meeting -- belongs to somebody else and is
+        never touched.
+        """
+        if not otid:
+            return False
+        return os.path.exists(os.path.join(self.spool_dir, f"{otid}.pcm"))
+
+    def reconcile(self) -> None:
+        """Ensure at most one recording exists, before one can start.
+
+        Runs once per daemon, before the mic watch reports anything, because
+        the first thing a fresh daemon does is tell MeetingWatch about an
+        in-progress call -- and an in-progress call is what makes it start
+        recording. Anything left live by the process this one replaced has
+        to be closed before that.
+        """
+        marker = record.read_active(self.core.STATE_DIR)
+
+        # Another helper is recording right now: two panels, or a restart
+        # that outran its predecessor. Stand down rather than compete for
+        # the microphone, and say why -- "start does nothing", unexplained,
+        # is the worst version of this.
+        marker_pid = int((marker or {}).get("pid") or 0)
+        if marker and marker_pid != os.getpid() and record.pid_alive(marker_pid):
+            self.blocked_by_pid = marker_pid
+            self.reconciled = True
+            self._reconcile_pending = False
+            self.log_event("reconcile_busy", pid=marker_pid,
+                           otid=marker.get("otid"))
+            self.emit(type="error", errorClass="internal", message=(
+                f"another Otter helper (pid {marker_pid}) is already "
+                "recording; this panel will not start a second one"))
+            self.emit_state()
+            return
+
+        try:
+            live_list = self.core.live_speeches(self.ensure_auth())
+        except Exception as e:
+            # No sweep without a session. Try again after the next refresh
+            # rather than concluding the world is clean -- concluding that
+            # wrongly is the whole bug.
+            self.log_event("reconcile_deferred", error=str(e))
+            self._reconcile_pending = True
+            self.emit_state()
+            return
+
+        live_otids = {s["otid"]: s for s in live_list}
+        mine, foreign = [], []
+        for otid, s in live_otids.items():
+            (mine if self.owns(otid) else foreign).append(otid)
+
+        # A marker whose speech is not in the feed's live set still has to be
+        # asked about directly: the feed is a page, not the whole account.
+        # And only ever reap something confirmed live -- re-opening a
+        # *finished* speech would put it back into RECORDING, which is worse
+        # than the orphan we came to fix.
+        marker_otid = str((marker or {}).get("otid") or "")
+        if marker_otid and marker_otid not in live_otids:
+            try:
+                state = self.core.speech_state(self.cookies, marker_otid)
+                if self.core.is_live(state):
+                    mine.append(marker_otid)
+                    live_otids[marker_otid] = {
+                        "otid": marker_otid,
+                        "startTime": int(state.get("start_time") or 0),
+                    }
+            except Exception as e:
+                self.log_event("reconcile_probe_failed",
+                               otid=marker_otid, error=str(e))
+
+        self.foreign_live = sorted(foreign)
+        if foreign:
+            self.log_event("reconcile_foreign", otids=self.foreign_live)
+
+        for otid in sorted(set(mine))[:MAX_REAP]:
+            info = live_otids.get(otid) or {}
+            try:
+                res = record.reap_orphan(
+                    self.core.Api, self.cookies, self.userid, otid,
+                    start_time=int(info.get("startTime") or 0),
+                    log=self.log_event)
+            except Exception as e:
+                _cls, msg = classify_error(e)
+                self.log_event("reap_failed", otid=otid, error=msg)
+                self.emit(type="reconciled", otid=otid, stopped=False,
+                          error=msg)
+                self.emit(type="error", errorClass="otter-api", message=(
+                    f"an interrupted recording ({otid[:8]}) is still live on "
+                    f"Otter and could not be closed: {msg}"))
+                continue
+            kept = os.path.join(self.spool_dir, f"{otid}.pcm")
+            kept = kept if os.path.exists(kept) else ""
+            self.emit(type="reconciled", otid=otid,
+                      stopped=bool(res.get("stopped")), keptSpool=kept,
+                      url=res.get("url", ""))
+            if not res.get("stopped"):
+                self.emit(type="error", errorClass="network", message=(
+                    f"an interrupted recording ({otid[:8]}) may still be live "
+                    f"on Otter: {res.get('stopError') or 'unknown'}"))
+
+        record.clear_active(self.core.STATE_DIR)
+        self.reconciled = True
+        self._reconcile_pending = False
+        self.blocked_by_pid = 0
+        self.log_event("reconciled", reaped=sorted(set(mine))[:MAX_REAP],
+                       foreign=self.foreign_live)
+        self.emit_state()
+
+    def read_autostart(self) -> dict:
+        try:
+            with open(self._autostart_path) as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def stamp_autostart(self, label: str) -> None:
+        """Remember that a meeting was auto-started, on disk.
+
+        On disk rather than in memory because the process that needs to know
+        is the one that replaces this one.
+        """
+        try:
+            os.makedirs(self.core.STATE_DIR, mode=0o700, exist_ok=True)
+            with open(self._autostart_path, "w") as fh:
+                json.dump({"label": label, "ts": time.time()}, fh)
+        except OSError:
+            pass
+
+    def autostart_blocked(self, label: str) -> float:
+        """Seconds of cooldown left for this meeting, 0 if it may start."""
+        stamp = self.read_autostart()
+        if str(stamp.get("label") or "") != label:
+            return 0.0
+        try:
+            age = time.time() - float(stamp.get("ts") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        # A clock that jumped backwards must not lock recording out.
+        if age < 0 or age >= AUTO_START_COOLDOWN_SEC:
+            return 0.0
+        return AUTO_START_COOLDOWN_SEC - age
+
+    def fail_start(self, err_class: str, msg: str, quiet: bool = False) -> None:
+        """Answer a start that will not happen.
+
+        `quiet` is for a start we deliberately suppressed: the terminal
+        `start_failed` frame still has to go out or the widget's pending
+        flag never clears, but a decision of ours is not a fault and has no
+        business painting red error text in the panel.
+        """
+        self.emit(type="start_failed", errorClass=err_class, message=msg)
+        if not quiet:
+            self.last_error = msg
+            self.emit(type="error", errorClass=err_class, message=msg)
+        self.log_event("start_fail", error=msg, errorClass=err_class,
+                       quiet=quiet)
+        self.emit_state()
+
+    def guard_start(self, cmd: dict) -> bool:
+        """Every reason not to start. True means "go ahead".
+
+        Ordered cheapest-first, and deliberately exhaustive: this is the one
+        place that stands between a restart loop and a pile of concurrent
+        live sessions.
+        """
+        auto = cmd.get("auto") is True
+        label = str(cmd.get("label") or "")
+
+        if self.blocked_by_pid and record.pid_alive(self.blocked_by_pid):
+            self.fail_start("internal", (
+                f"another Otter helper (pid {self.blocked_by_pid}) holds the "
+                "recording"))
+            return False
+        self.blocked_by_pid = 0
+
+        if auto and not self.reconciled:
+            # Not yet allowed to know whether something is already recording.
+            self.fail_start("suppressed", (
+                "not starting automatically yet -- still checking for a "
+                "recording already in progress"), quiet=True)
+            return False
+
+        if auto:
+            left = self.autostart_blocked(label)
+            if left > 0:
+                self.fail_start("suppressed", (
+                    f"{label or 'this meeting'} was auto-recorded "
+                    f"{int(AUTO_START_COOLDOWN_SEC - left)}s ago; not "
+                    "starting a second recording"), quiet=True)
+                return False
+
+        # The server is the last word. A flaky sweep must not block
+        # recording -- losing a meeting is worse than a duplicate -- so a
+        # failure here is logged and waved through.
+        try:
+            live_list = self.core.live_speeches(self.ensure_auth())
+        except Exception as e:
+            self.log_event("live_sweep_failed", error=str(e))
+            return True
+
+        ours = [s["otid"] for s in live_list if self.owns(s["otid"])]
+        theirs = [s["otid"] for s in live_list if not self.owns(s["otid"])]
+        self.foreign_live = sorted(theirs)
+        if theirs:
+            self.fail_start("otter-api", (
+                "Otter already has a recording in progress "
+                f"({theirs[0][:8]}); stop it first, or run "
+                "`otter.py reap --all` if it is a leftover"))
+            return False
+
+        # Ours and stranded: close it rather than making it a sibling.
+        for otid in ours[:MAX_REAP]:
+            info = next((s for s in live_list if s["otid"] == otid), {})
+            try:
+                record.reap_orphan(self.core.Api, self.cookies, self.userid,
+                                   otid, start_time=int(info.get("startTime") or 0),
+                                   log=self.log_event)
+                self.emit(type="reconciled", otid=otid, stopped=True)
+            except Exception as e:
+                _cls, msg = classify_error(e)
+                self.log_event("reap_failed", otid=otid, error=msg)
+                self.fail_start("otter-api", (
+                    f"a previous recording ({otid[:8]}) is still live and "
+                    f"could not be closed: {msg}"))
+                return False
+        return True
+
     def start(self, cmd: dict) -> None:
         if self.recorder:
             self.emit(type="start_failed", errorClass="internal", message="already recording")
             self.emit(type="error", errorClass="internal", message="already recording")
+            return
+        if self.finalizing:
+            self.fail_start("internal",
+                            "the previous recording is still finishing")
+            return
+        if not self.guard_start(cmd):
             return
         try:
             cookies = self.ensure_auth()
@@ -401,6 +680,7 @@ class Server:
                 capture_system=cmd.get("captureSystem", True) is not False,
                 emit=self.emit,
                 log=self.log_event,
+                state_dir=self.core.STATE_DIR,
             )
             rec.start()
         except Exception as e:
@@ -418,8 +698,12 @@ class Server:
         self.emit_state()
         self._live_retries = 0
         self.start_live(rec.otid)
+        if cmd.get("auto") is True:
+            self.stamp_autostart(str(cmd.get("label") or ""))
         self.log_event("start", otid=rec.otid, mic=rec.mic_source,
-                       monitor=len(rec._aux) > 0)
+                       monitor=len(rec._aux) > 0,
+                       auto=cmd.get("auto") is True,
+                       label=str(cmd.get("label") or ""))
 
     def start_live(self, otid: str) -> None:
         """Attach the live transcript. Best effort, by design.
@@ -560,7 +844,18 @@ class Server:
         self._next_tick = now + 1.0
 
         # With stdin no longer the shutdown signal, being orphaned is. If the
-        # shell died we would otherwise linger forever holding a microphone.
+        # shell died we would otherwise linger forever holding a microphone --
+        # and, worse, keep a speech live while the shell's replacement starts
+        # a second one. Shutting down runs the finalize path below, so the
+        # recording is closed properly rather than abandoned.
+        if self._parent > 1 and os.getppid() != self._parent:
+            self.log_event("orphaned", parent=self._parent,
+                           now=os.getppid())
+            self.emit(type="error", message=(
+                "the shell exited; finishing the recording and shutting down"))
+            self.running = False
+            return
+
         # Meeting join/leave signal: which apps hold a microphone capture.
         if now >= self._next_mic_check:
             self._next_mic_check = now + MIC_CHECK_SEC
@@ -574,6 +869,10 @@ class Server:
                       backlog=round(self.recorder.backlog_sec(), 1))
             if now >= self._next_health:
                 self._next_health = now + HEALTH_LOG_SEC
+                # Same cadence as the health line: refresh the marker so a
+                # later process resumes from a recent offset rather than
+                # from the start of the meeting.
+                self.recorder.mark_active()
                 self.log_event(
                     "health", elapsed=self.recorder.elapsed(),
                     backlog=round(self.recorder.backlog_sec(), 1),
@@ -624,16 +923,43 @@ class Server:
         if default:
             self.recorder.note_default(default)
 
+    def install_signals(self) -> None:
+        """Turn a polite kill into the graceful shutdown path.
+
+        Without this, SIGTERM ended the process outright: the loop's
+        finalize below never ran, so the socket died with no stop frame and
+        the speech stayed live on Otter forever. A shell restart sends
+        exactly that signal, and did -- repeatedly.
+
+        SIGKILL cannot be caught, which is why the on-disk marker exists as
+        well; this only removes the excuse for the cases that are catchable.
+        """
+        def bow_out(signum, _frame):
+            self.log_event("signal", signal=int(signum))
+            self.running = False
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(sig, bow_out)
+            except (ValueError, OSError):
+                pass  # not the main thread, or the platform disagrees
+
     def run(self) -> int:
         self.stdin_kind = stdin_kind()
         self._watch_stdin = self.stdin_kind in ("pipe", "socket")
         if self._watch_stdin:
             os.set_blocking(0, False)
-        self.refresh()
-        # Ground truth for MeetingWatch even if a call began before us.
-        self.check_mic_apps(force=True)
+        self.install_signals()
         self.log_event("serve_start", pid=os.getpid(),
                        version=getattr(self.core, "__version__", "unknown"))
+        self.refresh()
+        # Before the mic watch says a word. Its first report is what makes
+        # MeetingWatch start recording, and a fresh daemon must not do that
+        # until it knows what its predecessor left behind.
+        if self._reconcile_pending:
+            self.reconcile()
+        # Ground truth for MeetingWatch even if a call began before us.
+        self.check_mic_apps(force=True)
         if not self._watch_stdin:
             self.emit(type="error", message=(
                 f"no command channel (stdin is {self.stdin_kind}); "
@@ -697,10 +1023,23 @@ class Server:
             self.tick()
 
         # Never abandon a recording just because we're shutting down.
-        if self.recorder:
-            self.recorder.stop()
-        if self.finalizing:
-            self.finalizing.stop()
+        # `stop()` is the synchronous form: it drains, sends the stop frame,
+        # posts speech_finish and clears the marker. Skipping any of that is
+        # what leaves a speech live for the next daemon to trip over.
+        for rec in (self.recorder, self.finalizing):
+            if not rec:
+                continue
+            try:
+                res = rec.stop()
+                self.log_event("shutdown_finalize", otid=res.get("otid"),
+                               keptSpool=str(res.get("keptSpool") or ""),
+                               finishError=str(res.get("finishError") or ""))
+            except Exception as e:
+                # The marker survives a failure here on purpose: the next
+                # daemon's reconcile is the second chance.
+                self.log_event("shutdown_finalize_failed", error=str(e))
+        self.recorder = None
+        self.finalizing = None
         self.log_event("serve_stop")
         return 0
 

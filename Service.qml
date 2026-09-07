@@ -57,6 +57,15 @@ Item {
   // rather than red error text.
   property bool needsLogin: false
 
+  // Whether the helper has finished checking for a recording already in
+  // progress. Nothing auto-starts before it has: a helper that just replaced
+  // one killed mid-meeting has no idea what it left live on Otter.
+  property bool reconciled: false
+  // Another helper holding the recording (two panels, or a restart that
+  // outran its predecessor), and live recordings that are not ours.
+  property int otherDaemonPid: 0
+  property var foreignLive: []
+
   // Devices are fetched once per daemon lifetime, not polled: the idle
   // summary wants to name the mic in words rather than show a PipeWire id.
   property bool _devicesRequested: false
@@ -91,6 +100,8 @@ Item {
   signal recordingStartFailed(string errorClass, string message)
   signal recordingStopped(string url)
   signal recordingStopFailed(string errorClass, string message)
+  // A stray live recording the helper found and closed on its own.
+  signal recordingReconciled(string otid, bool stopped, string keptSpool)
 
   // ------------------------------------------------------------- commands
 
@@ -250,11 +261,17 @@ Item {
   // A changed default also moves the tick in the picker, so re-read the list.
   onDefaultSourceNameChanged: if (daemon.running) listDevices()
 
-  function startRecording() {
+  // `auto` marks a start the meeting watcher asked for rather than one a
+  // person clicked. The helper treats the two differently: an automatic
+  // start is subject to a per-meeting cooldown and waits for the
+  // already-recording check, while an explicit click is always honoured.
+  function startRecording(auto, label) {
     if (recording || pending) return
     pending = true
     pendingTimeout.restart()
-    if (!send({ cmd: "start", micDevice: micDevice, captureSystem: captureSystemAudio })) {
+    if (!send({ cmd: "start", micDevice: micDevice,
+                captureSystem: captureSystemAudio,
+                auto: auto === true, label: String(label || "") })) {
       pending = false
       lastError = "Otter helper is not running"
     }
@@ -283,7 +300,7 @@ Item {
 
   function toggleRecording() {
     if (recording) stopRecording()
-    else startRecording()
+    else startRecording(false, "")
   }
 
   // -------------------------------------------------------------- inbound
@@ -306,6 +323,10 @@ Item {
       if (msg.stdinMode !== undefined) stdinMode = String(msg.stdinMode)
       if (msg.commandable !== undefined) commandable = msg.commandable === true
       if (msg.needsLogin !== undefined) needsLogin = msg.needsLogin === true
+      if (msg.reconciled !== undefined) reconciled = msg.reconciled === true
+      if (msg.otherDaemonPid !== undefined)
+        otherDaemonPid = Number(msg.otherDaemonPid) || 0
+      if (msg.foreignLive !== undefined) foreignLive = msg.foreignLive || []
       recent = msg.recent || []
       lastError = Model.shortError(msg.error || "")
       recording = msg.recording === true
@@ -385,8 +406,18 @@ Item {
       pendingTimeout.stop()
       recording = false
       lastErrorClass = String(msg.errorClass || "internal")
-      lastError = Model.humanError(lastErrorClass, msg.message)
+      // "suppressed" is the helper declining on purpose -- something was
+      // already recording, or this meeting was auto-recorded moments ago.
+      // The terminal frame still has to clear `pending`, but painting red
+      // error text for a decision of ours would be a lie.
+      if (lastErrorClass !== "suppressed")
+        lastError = Model.humanError(lastErrorClass, msg.message)
       recordingStartFailed(lastErrorClass, String(msg.message || ""))
+      break
+
+    case "reconciled":
+      recordingReconciled(String(msg.otid || ""), msg.stopped === true,
+                          String(msg.keptSpool || ""))
       break
 
     case "stop_failed":
@@ -587,10 +618,13 @@ Item {
       root._lastExitCode = exitCode
       healthyTimer.stop()
       if (root.recording) {
-        // The helper finalizes on shutdown; we just can't see the result.
+        // The helper finalizes on a catchable signal, and leaves a marker on
+        // disk if it never got the chance; either way the replacement closes
+        // the recording out before it will start another.
         root.recording = false
         root.level = 0
-        root.lastError = "Otter helper stopped while recording"
+        root.reconciled = false
+        root.lastError = "Otter helper stopped while recording; recovering"
       }
       restartTimer.restart()
     }

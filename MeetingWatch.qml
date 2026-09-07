@@ -22,7 +22,10 @@ Item {
   readonly property bool micInUse: service !== null && service.micInUseByOther
   property int countdownSec: 5
 
-  signal startRequested()
+  // The label travels with the request: the helper keeps a per-meeting
+  // auto-start cooldown on disk, which is what stops a restart loop from
+  // recording the same call over and over.
+  signal startRequested(string label)
   signal stopRequested()
 
   property var mstate: MeetingState.initialState({
@@ -75,7 +78,7 @@ Item {
         countTick.stop()
         break
       case "REQUEST_START":
-        startRequested()
+        startRequested(mstate.activeLabel)
         break
       case "REQUEST_STOP":
         stopRequested()
@@ -180,6 +183,16 @@ Item {
     }
     function onRecordingStartFailed(errorClass, message) {
       root.dispatch({ type: "RECORDING_START_FAILED", errorClass: errorClass, message: message })
+    }
+    // A recording the helper found stranded and closed on its own. Worth a
+    // toast: the conversation exists in Otter and the user never stopped it.
+    function onRecordingReconciled(otid, stopped, keptSpool) {
+      if (!stopped) return
+      root.notify("Closed an interrupted recording",
+                  keptSpool !== ""
+                    ? "Some audio could not be uploaded and was kept on disk."
+                    : "A recording left running by a restart was finished.",
+                  "", false)
     }
     function onRecordingStopped(url) {
       root.dispatch({ type: "RECORDING_STOPPED", url: url })

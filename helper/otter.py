@@ -13,6 +13,8 @@ Subcommands:
     search <query>        search conversations (emails match participants)
     summarize <otid>      ask Otter's own LLM proxy about a conversation
     devices               PipeWire inputs, for the microphone picker
+    live                  recordings Otter still thinks are running
+    reap [otid...|--all]  close stray live recordings
     selftest              capture only: no network, audio counted and discarded
     serve                 daemon mode, driven by the QML side over stdin
 
@@ -453,6 +455,96 @@ def fetch_recent(cookies: dict[str, str], n: int) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------- live sessions
+
+# What a recording in progress actually reports. Verified 2026-09-07 against
+# a live recording, in both the single-speech and home-feed serializers:
+# both fields flip to "none"/"ALL_DONE" within ~2s of a clean stop.
+#
+# `end_time` looks like the obvious signal and is not one: it reads 0 on
+# every speech, finished or not, in both serializers.
+LIVE_STATUS = "live"
+RECORDING_STATE = "RECORDING"
+
+
+def is_live(speech: dict) -> bool:
+    """Whether Otter still considers this speech to be recording."""
+    if not isinstance(speech, dict):
+        return False
+    return (speech.get("live_status") == LIVE_STATUS
+            or speech.get("speech_processing_state") == RECORDING_STATE)
+
+
+def live_speeches(cookies: dict[str, str]) -> list[dict]:
+    """Every speech Otter still considers live.
+
+    Cheap on purpose. The home feed already carries both liveness fields, so
+    finding a stray recording costs the one call the panel makes anyway
+    instead of a probe per conversation.
+
+    Why this exists: a helper killed mid-recording leaves its speech live
+    **forever** -- measured, it never self-closes -- so a restarted daemon
+    that simply starts another one ends up with several live sessions at
+    once. That happened: five in ninety seconds, one shell restart each.
+    """
+    params = urllib.parse.urlencode({
+        "funnel": "home_feed",
+        "page_size": 12,
+        "source": "home",
+        "speech_metadata": "true",
+        "use_serializer": "HomeFeedSpeechWithoutSharedGroupsSerializer",
+    })
+    st, body = api_get(f"{API}/available_speeches?{params}", cookies)
+    if st in (401, 403):
+        raise _auth_error(st, body, "available_speeches")
+    if st != 200:
+        raise OtterError(f"available_speeches returned {st}")
+    try:
+        speeches = json.loads(body).get("speeches", []) or []
+    except ValueError:
+        raise OtterError("available_speeches returned invalid JSON")
+
+    out = []
+    for s in speeches:
+        if not is_live(s):
+            continue
+        otid = s.get("otid") or s.get("speech_otid") or ""
+        if not otid:
+            continue
+        out.append({
+            "otid": otid,
+            "speechId": str(s.get("speech_id") or ""),
+            "title": s.get("title") or "",
+            "startTime": int(s.get("start_time") or s.get("created_at") or 0),
+            "liveStatus": str(s.get("live_status") or ""),
+            "state": str(s.get("speech_processing_state") or ""),
+        })
+    return out
+
+
+def speech_state(cookies: dict[str, str], otid: str) -> dict:
+    """The single-speech view of one conversation.
+
+    Worth the extra call over the feed in one case: this serializer fills in
+    `process_finished`, which the feed leaves null, and it answers for a
+    speech old enough to have fallen off the feed.
+    """
+    if not otid:
+        raise OtterError("no conversation id")
+    st, body = api_get(f"{API}/speech?otid={urllib.parse.quote(otid)}", cookies)
+    if st in (401, 403):
+        raise _auth_error(st, body, "speech")
+    if st == 404:
+        return {}
+    if st != 200:
+        raise OtterError(f"speech returned {st}")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise OtterError("speech returned invalid JSON")
+    return (data.get("speech") or {}) if isinstance(data, dict) else {}
+
+
 def fetch_transcript(cookies: dict[str, str], otid: str,
                      speaker_timestamps: bool = False) -> str:
     """Plain-text transcript for one conversation.
@@ -622,6 +714,61 @@ def cmd_summarize(args) -> dict:
             "summary": ask_llm(cookies, transcript, args.prompt), "error": ""}
 
 
+def cmd_live(args) -> dict:
+    """Every recording Otter still thinks is running."""
+    cookies = get_cookies(args)
+    return {"ok": True, "authenticated": True,
+            "live": live_speeches(cookies), "error": ""}
+
+
+def cmd_reap(args) -> dict:
+    """Close live speeches that nothing is feeding any more.
+
+    The manual counterpart to what the daemon does on startup, and the way
+    out if that ever fails. Named otids are checked for liveness first:
+    re-opening a finished speech would put it back into RECORDING.
+    """
+    import record
+
+    cookies = get_cookies(args)
+    uid = user_id(cookies)
+    if not uid:
+        raise OtterError("could not determine your Otter user id")
+
+    live = live_speeches(cookies)
+    by_otid = {s["otid"]: s for s in live}
+    if args.all:
+        targets = list(by_otid)
+    else:
+        targets = [o for o in (args.otid or []) if o]
+        if not targets:
+            raise OtterError("name an otid to reap, or pass --all")
+
+    results = []
+    for otid in targets:
+        info = by_otid.get(otid)
+        if info is None:
+            state = speech_state(cookies, otid)
+            if not state:
+                results.append({"otid": otid, "skipped": "no such conversation"})
+                continue
+            if not is_live(state):
+                results.append({"otid": otid, "skipped": "not live"})
+                continue
+            info = {"startTime": int(state.get("start_time") or 0)}
+        try:
+            results.append(record.reap_orphan(
+                Api, cookies, uid, otid,
+                start_time=int(info.get("startTime") or 0)))
+        except Exception as e:
+            results.append({"otid": otid, "stopped": False, "error": str(e)})
+
+    remaining = [s["otid"] for s in live_speeches(cookies)]
+    return {"ok": all(r.get("stopped") or r.get("skipped") for r in results),
+            "authenticated": True, "reaped": results,
+            "stillLive": remaining, "error": ""}
+
+
 def cmd_devices(args) -> dict:
     import audio
     return {"ok": True, "authenticated": True,
@@ -744,6 +891,16 @@ def main() -> int:
 
     p_dev = sub.add_parser("devices", help="list PipeWire input devices")
     p_dev.set_defaults(func=cmd_devices)
+
+    p_live = sub.add_parser("live", help="list recordings Otter still thinks "
+                                         "are running")
+    p_live.set_defaults(func=cmd_live)
+
+    p_reap = sub.add_parser("reap", help="close stray live recordings")
+    p_reap.add_argument("otid", nargs="*", help="conversations to close")
+    p_reap.add_argument("--all", action="store_true",
+                        help="close every live recording on the account")
+    p_reap.set_defaults(func=cmd_reap)
 
     p_self = sub.add_parser(
         "selftest", help="capture a few seconds locally and report byte counts "

@@ -40,6 +40,12 @@ Item {
   // Daemon restart bookkeeping, reported through note() on the next start.
   property bool _sawDaemonExit: false
   property int _lastExitCode: 0
+  // Whether the helper is actually down. `daemon.running` cannot answer
+  // that -- it still reads true after the process has exited, which is why
+  // the restart below has to force it false before setting it true again.
+  // Tracking the exit ourselves is what keeps that force-false from killing
+  // a daemon that is alive and, quite possibly, recording.
+  property bool _daemonDown: false
   property var devices: []
 
   // True from clicking start until the helper confirms, so the button can't
@@ -552,6 +558,13 @@ Item {
   // exits the property can still read true, and assigning the value it
   // already holds changes nothing -- which silently turned this into a
   // one-shot and left the daemon dead after its first exit.
+  //
+  // But that force-false *kills* a helper that is alive, and killing it
+  // fires onExited, which schedules another restart -- a self-feeding loop
+  // that tore the helper down every backoff interval forever, recording or
+  // not. Observed live: a recording started at 21:26:07 and was signalled
+  // away at 21:26:08. So the restart only ever runs against a helper we
+  // have actually seen exit, and a helper that comes back cancels it.
   Timer {
     id: restartTimer
     property int attempts: 0
@@ -559,6 +572,7 @@ Item {
     repeat: false
     onTriggered: {
       if (root.helperPath === "") return
+      if (!root._daemonDown) return
       attempts += 1
       daemon.running = false
       daemon.running = true
@@ -600,6 +614,9 @@ Item {
     }
 
     onStarted: {
+      // It is up, so any queued restart is now a request to kill it.
+      root._daemonDown = false
+      restartTimer.stop()
       healthyTimer.restart()
       root._devicesRequested = false
       // A previous exit is worth recording once the channel is back --
@@ -615,6 +632,7 @@ Item {
       root.everLoaded = true
       root.pending = false
       root._sawDaemonExit = true
+      root._daemonDown = true
       root._lastExitCode = exitCode
       healthyTimer.stop()
       if (root.recording) {

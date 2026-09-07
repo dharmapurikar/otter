@@ -877,7 +877,10 @@ class TestServerDispatch(unittest.TestCase):
         core = StubCore(recent=[{"otid": "a", "title": "Standup"}])
         server = self.make(core)
         server.refresh()
-        self.assertEqual(self.types(), ["state"])
+        # The first refresh also reconciles, which emits a second state once
+        # the sweep has finished. What matters is that the panel is told
+        # first -- see test_state_is_emitted_before_reconcile_blocks.
+        self.assertEqual(self.types()[0], "state")
         state = self.emitted[0]
         self.assertTrue(state["authenticated"])
         self.assertFalse(state["recording"])
@@ -1961,6 +1964,79 @@ class TestRecoveryArgs(SingleFlightBase):
         self.patch_reap.start()
         self.assertTrue(any("10.0s" in e.get("message", "")
                             for e in self.frames("error")))
+
+
+class TestReconcileDoesNotBlankThePanel(SingleFlightBase):
+    """Reconciling blocks the loop; it must not blank the panel while it does.
+
+    Measured on a live shell restart: sweeping the account and closing one
+    stray took fifteen seconds, and handing off to it before emitting state
+    left the widget with no state at all for that window -- which the panel
+    renders as "signed out" while the helper is in fact fine.
+    """
+
+    def test_state_is_emitted_before_reconcile_blocks(self):
+        server = self.make(recent=[{"otid": "a", "title": "Standup"}])
+        order = []
+        server.emit = lambda **k: order.append(k.get("type"))
+        real = server.reconcile
+
+        def slow_reconcile():
+            order.append("reconcile-begins")
+            real()
+
+        server.reconcile = slow_reconcile
+        server.refresh()
+        self.assertEqual(order[0], "state")
+        self.assertLess(order.index("state"), order.index("reconcile-begins"))
+
+    def test_the_state_before_reconcile_tells_the_truth(self):
+        server = self.make(recent=[{"otid": "a", "title": "Standup"}])
+        server.refresh()
+        first = self.frames("state")[0]
+        self.assertTrue(first["authenticated"])
+        self.assertEqual(len(first["recent"]), 1)
+        # Not yet reconciled, so an auto-start is still held back.
+        self.assertFalse(first["reconciled"])
+
+    def test_the_reconcile_result_follows(self):
+        server = self.make(recent=[], live=[{"otid": "stray"}])
+        self.spool(server, "stray")
+        server.refresh()
+        self.assertTrue(self.frames("reconciled"))
+        self.assertTrue(self.frames("state")[-1]["reconciled"])
+
+    def test_refresh_reconciles_only_once(self):
+        server = self.make()
+        server.refresh()
+        self.emitted.clear()
+        server.refresh()
+        self.assertEqual(self.frames("reconciled"), [])
+        self.assertEqual(len(self.frames("state")), 1)
+
+    def test_a_signed_out_helper_still_reports_state(self):
+        server = self.make(fail="not signed in")
+        server.refresh()
+        state = self.frames("state")[0]
+        self.assertFalse(state["authenticated"])
+        self.assertTrue(state["needsLogin"])
+        # And the gate stays shut, because nothing could be swept.
+        self.assertFalse(state["reconciled"])
+
+    def test_reconcile_is_not_attempted_while_recording(self):
+        # It would clear the marker for the recording in progress.
+        class Busy:
+            otid = "in-progress"
+            source_label = "mic+system"
+
+            def elapsed(self):
+                return 42
+
+        server = self.make()
+        server.recorder = Busy()
+        server.refresh()
+        self.assertFalse(server.reconciled)
+        self.assertTrue(self.frames("state"))
 
 
 if __name__ == "__main__":

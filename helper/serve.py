@@ -306,12 +306,17 @@ class Server:
                 pass
             self._auth_retry = min(AUTH_RETRY_MAX_SEC, self._auth_retry * 1.6)
         self._next_refresh = time.monotonic() + self.refresh_interval()
+        # State first, always. Reconciling blocks this loop for as long as it
+        # takes to sweep the account and close a stray -- fifteen seconds,
+        # measured -- and handing off to it before saying anything left the
+        # panel with no state at all for that whole window, which renders as
+        # "signed out". The panel gets the truth now and the reconcile
+        # result when it lands.
+        self.emit_state()
         # A reconcile that could not run for want of a session gets its
         # chance the moment one appears. Until then nothing may auto-start.
         if self._reconcile_pending and self.authenticated and not self.recorder:
             self.reconcile()
-            return
-        self.emit_state()
 
     def refresh_interval(self) -> float:
         if not self.authenticated:
@@ -987,12 +992,12 @@ class Server:
         self.install_signals()
         self.log_event("serve_start", pid=os.getpid(),
                        version=getattr(self.core, "__version__", "unknown"))
+        # refresh() reconciles synchronously once it has a session, so this
+        # returns with the sweep already done -- which has to be before the
+        # mic watch says a word, since its first report is what makes
+        # MeetingWatch start recording. Signed out, the sweep cannot run at
+        # all; `reconciled` stays false and that alone blocks an auto-start.
         self.refresh()
-        # Before the mic watch says a word. Its first report is what makes
-        # MeetingWatch start recording, and a fresh daemon must not do that
-        # until it knows what its predecessor left behind.
-        if self._reconcile_pending:
-            self.reconcile()
         # Ground truth for MeetingWatch even if a call began before us.
         self.check_mic_apps(force=True)
         if not self._watch_stdin:

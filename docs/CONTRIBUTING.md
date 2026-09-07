@@ -1,9 +1,16 @@
-# Working on the Otter plugin (agent orientation)
+# Contributing to the Otter plugin
 
-Read this first. It tells you what this repo is, what to read in what order,
-where the reference material on this machine lives, and what state the build
-is in. Everything needed to build the plugin is either in `docs/` or pointed
-to from here.
+Read this first if you are working on the code. It tells you what this repo
+is, what to read in what order, where the reference material on this machine
+lives, and what state the build is in. Everything needed to build the plugin
+is either in `docs/` or pointed to from here.
+
+This file deliberately lives under `docs/` rather than as a root `AGENTS.md`.
+Omarchy installs the repository tree into the plugin scope, so a root agent
+instruction file becomes part of the ambient context of any coding agent
+working in an install -- repository-authored instructions the user never
+asked for. Guidance for people (and for agents a contributor points here on
+purpose) belongs on a path nothing reads automatically.
 
 ## What you're building
 
@@ -139,6 +146,7 @@ MeetingWatch.qml         notices meetings (Wayland windows + mic captures); coun
 scripts/otter_probe.py   standalone auth/API diagnostic, kept from before the helper existed
 test/test_helper.py      python tests for ws/audio/spool/daemon
 docs/                    the documentation (user-facing first, then technical)
+docs/CONTRIBUTING.md     this file: orientation for anyone working on the code
 ```
 
 `helper/otter.py` supersedes `scripts/otter_probe.py` — the probe stays

@@ -102,6 +102,7 @@ design and its trade-offs in [AUTH.md](AUTH.md).
 | [ARCHITECTURE.md](ARCHITECTURE.md) | technical | Components, process model, the stdio protocol |
 | [ROADMAP.md](ROADMAP.md) | everyone | What's shipped, the backlog, what's deliberately not doing |
 | [PROTOCOL.md](PROTOCOL.md) | technical | The private Otter API: endpoints, upload socket, live-transcript socket |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | contributors | Working on the code: what to read, how to test, what not to break |
 
 ## Status
 

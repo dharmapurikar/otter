@@ -41,7 +41,7 @@ sign-in, the API, and PipeWire recording.
 Everything below is either stock Omarchy or one command away on Arch.
 
 - **Omarchy** on the Quattro shell (plugin support).
-- **Python 3** — the helper is standard library only; nothing to pip install.
+- **Python 3** — the helper uses the standard library only, with no third-party packages.
 - **ffmpeg** — captures microphone and system audio.
 - **PipeWire** with `pactl` — Omarchy's default audio stack; lists and watches
   input devices.
@@ -128,5 +128,5 @@ Working, and verified end to end on real hardware. Documentation in
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — the Otter private API reference
 - [docs/ROADMAP.md](docs/ROADMAP.md) — what's shipped, the backlog, what's deliberately not doing
 
-Developers and AI agents working on the code should start with
-[AGENTS.md](AGENTS.md).
+Anyone working on the code should start with
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
